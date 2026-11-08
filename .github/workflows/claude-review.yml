@@ -20,13 +20,11 @@ name: Claude Review
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
-#   4. The job's token can write only to pull requests and, for the spend
-#      ledger and its alerts, to issues (preflight, live-test and spend jobs),
-#      and the review app's token (below) only to pull requests and issues of
-#      this repository, and in full mode to the media repository's contents
-#      (REVIEW_MEDIA_REPO). The job token of the review job, which runs the
-#      model, has no issues: write (the app token it mints does, to post and
-#      react). The job token can't read repository variables.
+#   4. The job's token can write only to pull requests, and the review app's
+#      token (below) only to pull requests and issues of this repository, and
+#      in full mode to the media repository's contents
+#      (REVIEW_MEDIA_REPO). The job token has no issues: write (the app token
+#      it mints does, to post and react) and can't read repository variables.
 #      The model has no shell and no mutation tools: it posts inline comments
 #      through the action's tool (which redacts secrets) and returns the summary
 #      as fields, which a workflow step renders, redacts and posts. In light
@@ -104,8 +102,7 @@ name: Claude Review
 # `pull_request` workflow can upload an artifact with any name.
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
-# in the job summary and in one comment on the spend ledger issue (bot.py,
-# record), read by the preflight and the live test to enforce the spend caps.
+# in the job summary, never on the PR.
 
 on:
   issue_comment:
@@ -116,6 +113,8 @@ permissions: {}
 env:
   # No __pycache__ in the tree the model reads.
   PYTHONDONTWRITEBYTECODE: 1
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
 
 jobs:
   # Decides whether a comment starts a review, in which mode and with which
@@ -147,8 +146,6 @@ jobs:
       contents: read
       # The one-line reply to a refused request.
       pull-requests: write
-      # The spend check reads the ledger issue and alerts on the status issue.
-      issues: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
@@ -196,6 +193,9 @@ jobs:
   review:
     name: Review
     needs: preflight
+    # issue_comment runs on the default branch, so the environment's branch rule passes; a branch's own
+    # workflow can't read these secrets.
+    environment: review-bot
     if: needs.preflight.outputs.run == 'true'
     # Job-level, and only for a request the preflight accepted, so no other
     # comment can cancel a review in progress.
@@ -207,18 +207,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     outputs:
-      mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+      mode: ${{ steps.pr.outputs.mode }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
-      result: ${{ steps.review.outputs.structured_output }}
+      # The summary's fields as `post` rendered them, with what it carried over from the earlier review.
+      result: ${{ steps.post.outputs.result }}
       # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
       rereview: ${{ steps.diff.outputs.rereview }}
       # stacked-above.json, for the approval rule's count of findings fixed above.
       above: ${{ steps.diff.outputs.above }}
       # Finished and returned its summary itself: a salvaged or stopped review never approves.
       complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
-      # What the run used, for the ledger (the `spend` job below).
-      usage: ${{ steps.usage.outputs.record }}
     permissions:
       # actions: read lists and downloads the saved handoff for /review continue.
       actions: read
@@ -259,35 +258,34 @@ jobs:
           persist-credentials: false
 
       # React 👀 to the /review comment, since a comment-triggered run is otherwise
-      # invisible from the PR; then the PR's refs and title (an issue_comment event
-      # doesn't carry the PR's head or base) and the review's settings.
+      # invisible from the PR. Best effort, with the app token (a reaction needs
+      # issues: write, the job's token only has read), so it isn't part of the
+      # next step, which reads the saved handoff with the job's token.
+      - name: React to the /review comment
+        if: steps.base.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: python3 .github/review/bot.py react
+
+      # The PR's refs and title (an issue_comment event doesn't carry the PR's head
+      # or base) and the review's settings; for /review continue, the handoff a
+      # stopped review saved ("Write the handoff" below; bot.py, restore, says which
+      # it trusts), which waits in $RUNNER_TEMP until the diff step.
       - name: Resolve the PR
         if: steps.base.outcome == 'success'
         id: pr
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          COMMENT_ID: ${{ github.event.comment.id }}
           MODE: ${{ needs.preflight.outputs.mode }}
           NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
         run: python3 .github/review/bot.py resolve
 
-      # /review continue: fetch the handoff a stopped review saved (see "Write
-      # the handoff" below); it waits in $RUNNER_TEMP until the diff step
-      # (bot.py, restore, says which handoffs it trusts).
-      - name: Restore the stopped review
-        if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
-        id: prev
-        continue-on-error: true
-        env:
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
-        run: python3 .github/review/bot.py restore
-
       # Untrusted: the PR's tree, for reading changed files in full context.
       # Never executed.
       - name: Check out the PR into pr-head/
-        if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
+        if: steps.pr.outcome == 'success'
         id: head
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -303,9 +301,9 @@ jobs:
         id: diff
         continue-on-error: true
         env:
-          PREV: ${{ steps.prev.outputs.dir }}
+          PREV: ${{ steps.pr.outputs.dir }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          MODE: ${{ steps.pr.outputs.mode }}
         run: python3 .github/review/bot.py collect
 
       - name: Review
@@ -314,7 +312,7 @@ jobs:
         # Never red: an API or action failure (bad key, outage, out of turns,
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
-        timeout-minutes: ${{ fromJSON(steps.prev.outputs.timeout || steps.pr.outputs.timeout || '25') }}
+        timeout-minutes: ${{ fromJSON(steps.pr.outputs.timeout || '25') }}
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -337,16 +335,16 @@ jobs:
             exactly. It defines your trust boundary, inputs and output format, and points
             you to the method and its bar.
 
-            Mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+            Mode: ${{ steps.pr.outputs.mode }}
             PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
             Head commit (pass as commit_id on every inline comment): ${{ steps.pr.outputs.head_sha }}
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
             Turn cap: ${{ needs.preflight.outputs.turns }}.
-            ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
+            ${{ steps.pr.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
             ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a force-push, rebase or merge of main, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
-          # No shell or edits; web reads only from the sites listed here (GitHub, the
+          # No shell or edits; page fetches only from the sites listed here (GitHub, the
           # vLLM and SGLang docs, Hugging Face, PyTorch, arXiv) and Claude Code's
-          # built-in documentation sites, so the review can read how other projects do it. The only write tool is the inline-
+          # built-in documentation sites, so the review can read how other projects do it; WebSearch has no domain list. The only write tool is the inline-
           # comment tool, which the action loads only when it is listed here and
           # which redacts secrets. The summary comes back as structured output.
           # The turn cap is the preflight's: CLAUDE_REVIEW_MAX_TURNS (40) for a
@@ -356,7 +354,7 @@ jobs:
           # (Task/Agent) review slices of a big PR under the same restrictions.
           claude_args: |
             --model claude-opus-5-5
-            --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}
+            --effort high
             --max-turns ${{ needs.preflight.outputs.turns }}
             --permission-mode dontAsk
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Task,Agent,WebSearch,WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com),WebFetch(domain:docs.vllm.ai),WebFetch(domain:docs.sglang.ai),WebFetch(domain:docs.sglang.io),WebFetch(domain:huggingface.co),WebFetch(domain:pytorch.org),WebFetch(domain:docs.pytorch.org),WebFetch(domain:arxiv.org)"
@@ -390,16 +388,14 @@ jobs:
         run: python3 .github/review/bot.py salvage
 
       # What the run used, from the execution file or, after a timeout, the
-      # session transcript: a table in the job summary, and the record the
-      # `spend` job appends to the ledger. Never posted on the PR.
+      # session transcript: a table in the job summary. Never posted on the PR.
       - name: Record usage
         if: always() && steps.diff.outcome == 'success'
-        id: usage
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-          PREV: ${{ steps.prev.outputs.dir }}
+          MODE: ${{ steps.pr.outputs.mode }}
+          PREV: ${{ steps.pr.outputs.dir }}
           OUTCOME: ${{ steps.review.outcome }}
         run: python3 .github/review/bot.py usage
 
@@ -416,9 +412,10 @@ jobs:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          MODE: ${{ steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
@@ -453,8 +450,8 @@ jobs:
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-          PREV: ${{ steps.prev.outputs.dir }}
+          MODE: ${{ steps.pr.outputs.mode }}
+          PREV: ${{ steps.pr.outputs.dir }}
         run: python3 .github/review/bot.py handoff
 
       - name: Upload the handoff
@@ -476,17 +473,16 @@ jobs:
       - name: Report a review that didn't complete
         if: >-
           always() && steps.salvage.outputs.billing != 'true' &&
-          (steps.pr.outcome == 'failure' || steps.prev.outcome == 'failure' ||
-           steps.head.outcome == 'failure' ||
+          (steps.pr.outcome == 'failure' || steps.head.outcome == 'failure' ||
            steps.diff.outcome == 'failure' || steps.post.outcome == 'failure' ||
            (steps.review.outcome == 'failure' && steps.salvage.outputs.structured_output == ''))
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
-          WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why }}
+          WHY: ${{ steps.salvage.outputs.why || steps.pr.outputs.why }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           CAN_CONTINUE: ${{ steps.upload.outcome == 'success' }}
-          REFUSED: ${{ steps.prev.outcome == 'failure' }}
+          REFUSED: ${{ steps.pr.outputs.refused == 'true' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/bot.py incomplete
 
@@ -496,24 +492,16 @@ jobs:
   live-test:
     name: Live test
     needs: review
+    environment: review-bot
     if: needs.review.outputs.mode == 'full' && needs.review.outputs.complete == 'true'
     concurrency:
       group: claude-live-test-${{ github.event.issue.number }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    outputs:
-      # What the GPUs and the box's session cost, and what was decided, for the ledger.
-      gpu_usd: ${{ steps.release.outputs.gpu_usd }}
-      box_usd: ${{ steps.release.outputs.box_usd }}
-      approval: ${{ steps.approve.outputs.approval }}
-      # A re-run of only the spend job keeps this; a re-run of the live test changes it. The ledger's key.
-      live_attempt: ${{ github.run_attempt }}
     permissions:
       contents: read
       pull-requests: write
-      # The spend check before the GPUs start: reads the ledger, and alerts on the status issue.
-      issues: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
@@ -528,12 +516,15 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables; the Slurm nodes' key from a secret, and
-      # each node's host and pinned host key from REVIEW_SLURM_NODES. Nothing here reaches the box.
+      # gpu.py's settings, from repository variables; the ssh key every box is reached with from a
+      # secret, and each node's host and pinned host key from REVIEW_SLURM_NODES. The key stays on
+      # the runner: it never reaches the box.
       - name: Configure the GPUs
         env:
-          SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
+          SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
+          SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
+          COMMENTER: ${{ github.event.comment.user.login }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
@@ -557,7 +548,8 @@ jobs:
       # them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
       # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
       # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
-      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry). A
+      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
+      # re-review with `untestable` set is exempt, since that PR can't be approved. A
       # `none` that stands runs nothing (verdict `skipped`), and counts as a pass for approval after
       # that pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
       # test, so the next run still checks against the last real one. A failed read of the PR's comments
@@ -698,7 +690,6 @@ jobs:
       # Whatever this run launched goes, even after a cancel or a failure above.
       - name: Release the GPUs
         if: always() && steps.cfg.outcome == 'success'
-        id: release
         continue-on-error: true
         run: python3 .github/review/gpu_review.py cleanup
 
@@ -713,38 +704,3 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/gpu_review.py incomplete
-
-  # The one writer of the spend ledger: one comment per attempt of a run, after the review and the
-  # live test whatever became of them, so the caps see every run that spent anything.
-  # A job of its own, so the job token's `issues: write` stays out of the job that runs the model.
-  spend:
-    name: Record spend
-    needs: [preflight, review, live-test]
-    if: always() && needs.preflight.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      issues: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REPO: ${{ github.repository }}
-      PR: ${{ github.event.issue.number }}
-    steps:
-      - name: Check out main's scripts
-        continue-on-error: true
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: .github/review
-          persist-credentials: false
-
-      - name: Append this run to the spend ledger
-        continue-on-error: true
-        env:
-          USAGE: ${{ needs.review.outputs.usage }}
-          GPU_USD: ${{ needs.live-test.outputs.gpu_usd }}
-          BOX_USD: ${{ needs.live-test.outputs.box_usd }}
-          APPROVAL: ${{ needs.live-test.outputs.approval }}
-          LIVE_ATTEMPT: ${{ needs.live-test.outputs.live_attempt }}
-        run: python3 .github/review/bot.py record

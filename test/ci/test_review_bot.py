@@ -4,6 +4,7 @@ import base64
 import contextlib
 import datetime
 import fnmatch
+import importlib
 import json
 import os
 import subprocess
@@ -16,13 +17,14 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / ".github/review"))
 import bot  # noqa: E402
+import render_summary  # noqa: E402
 
 
 class Fail:
     """A call that fails, as GitHub's errors do, with exit status `code`."""
 
-    def __init__(self, stderr="HTTP 502", code=1):
-        self.stderr, self.code = stderr, code
+    def __init__(self, stderr="HTTP 502", code=1, stdout=""):
+        self.stderr, self.code, self.stdout = stderr, code, stdout
 
 
 class FakeGh:
@@ -78,7 +80,7 @@ class FakeGh:
         if isinstance(answer, Fail):
             if check:
                 raise RuntimeError(f"{key}: {answer.stderr}")
-            return subprocess.CompletedProcess(argv, answer.code, "", answer.stderr)
+            return subprocess.CompletedProcess(argv, answer.code, answer.stdout, answer.stderr)
         if not isinstance(answer, str):
             answer = json.dumps([answer] if "--slurp" in argv else answer)
         return subprocess.CompletedProcess(argv, 0, answer, "")
@@ -113,7 +115,6 @@ class TestPreflight(unittest.TestCase):
         routes = {f"GET repos/o/r/collaborators/{login}/permission": {"permission": perm}
                   for login, perm in perms.items()}
         routes["pr comment"] = "https://github.com/o/r/pull/1#issuecomment-9"
-        routes["GET repos/o/r/issues[?]*"] = []  # no ledger yet: nothing spent
         out, fake = step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command=command, actor=actor,
                          author=author, assoc=assoc, skip_label="false")
         return out, [stdin for key, stdin in fake.writes()]
@@ -143,145 +144,8 @@ HEAD, LAST = "1" * 40, "2" * 40
 
 
 NOW = datetime.datetime(2026, 11, 8, 12, tzinfo=datetime.timezone.utc)
-LEDGER = {"number": 1, "user": {"login": "github-actions[bot]"}, "body": bot.issue_marker("ledger") + "\nthe ledger"}
-STATUS = {"number": 2, "user": {"login": "github-actions[bot]"}, "body": bot.issue_marker("status") + "\nthe status"}
-
-
-def spent(usd, created="2026-11-08T01:00:00Z", run="1", attempt="1", login="github-actions[bot]", **extra):
-    """A ledger comment recording a run that cost `usd`."""
-    record = base64.b64encode(json.dumps({"usd": usd, "run": run, "attempt": attempt, **extra}).encode()).decode()
-    return {"user": {"login": login}, "created_at": created,
-            "body": f"PR #1: ${usd}.\n<!-- review-spend {record} -->\n"}
-
-
-class TestSpend(unittest.TestCase):
-    def spend(self, comments, issues=(LEDGER,)):
-        routes = {"GET repos/o/r/issues[?]*": list(issues),
-                  "GET repos/o/r/issues/1/comments*": comments, "GET repos/o/r/issues/2/comments*": comments}
-        with mock.patch.object(bot, "run", FakeGh(routes)):
-            return bot.spend("o/r", NOW)
-
-    def test_spend_sums_this_day_and_month_once_per_run_and_attempt_from_the_bots_comments_alone(self):
-        self.assertEqual(self.spend([spent(1.5), spent(2, "2026-11-01T23:59:59Z", run="2"),
-                                     spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
-        self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
-                         "a re-recorded run would count twice")
-        first = spent(1, usage={"run_attempt": "1"})
-        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "1"})])["day"], 1,
-                         "re-running only a run's spend job would count its costs twice")
-        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})])["day"], 2,
-                         "re-running all a run's jobs spends again, and that would go uncounted")
-        live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1, "live_attempt": "1"}
-        rerun = {**live, "gpu_usd": 5, "live_attempt": "2"}
-        self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **rerun),
-                                     spent(16, attempt="3", **rerun)])["day"], 19,
-                         "re-running only the live test spends GPUs again, its review tokens are already counted, "
-                         "and re-running only the spend job after that adds nothing")
-        free = {"usage": {"run_attempt": "1"}, "gpu_usd": 0.0, "box_usd": 0.0}
-        comments = [spent(1, **free, live_attempt="1", approval="approve"),
-                    spent(1, attempt="2", **free, live_attempt="2", approval="approve"),
-                    spent(1, attempt="3", **free, live_attempt="2", approval="approve")]
-        self.assertEqual(self.spend(comments)["day"], 1, "a free live test re-run would count its review tokens again")
-        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [LEDGER],
-                                                   "GET repos/o/r/issues/1/comments*": comments})):
-            kept = [r["approval"] for _, r in bot.ledger("o/r", "2026-11-01T00:00:00Z")]
-        self.assertEqual(kept, ["approve", "approve"], "a live test re-run costing the same as the first would be lost")
-        self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")])["day"], 2,
-                         "a record with no usage counts by its own attempt")
-        self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
-                         "anyone could add a record to a public issue and reach the cap")
-
-    def test_spend_reads_every_ledger_issue_and_starts_at_the_lowest_for_writes(self):
-        self.assertEqual(self.spend([spent(1)], issues=(LEDGER, {**STATUS, "body": LEDGER["body"]}))["day"], 1,
-                         "the same run recorded in two issues would double")
-        comments = {1: [spent(1, run="1")], 2: [spent(2, run="2")]}
-        with mock.patch.object(bot, "run", FakeGh({
-                "GET repos/o/r/issues[?]*": [{**STATUS, "body": LEDGER["body"]}, LEDGER],
-                "GET repos/o/r/issues/1/comments*": comments[1], "GET repos/o/r/issues/2/comments*": comments[2]})):
-            self.assertEqual(bot.spend("o/r", NOW)["day"], 3, "a run in the second ledger issue would be missed")
-            self.assertEqual(bot.issue("o/r", "ledger"), 1, "writers would split across ledger issues")
-
-    def test_a_full_ledger_issue_rolls_over_and_a_failed_record_alerts(self):
-        full = {**LEDGER, "comments": bot.ISSUE_COMMENTS}
-        spare = {**LEDGER, "number": 3, "comments": 0}
-        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [full, spare]})):
-            self.assertEqual(bot.issue("o/r", "ledger"), 3, "a full issue would keep being written to")
-        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [full],
-                                                   "POST repos/o/r/issues": {"number": 4}})):
-            self.assertEqual(bot.issue("o/r", "ledger"), 4, "no new ledger issue when the last one is full")
-        comments = []
-
-        def comment(argv, stdin):
-            comments.append(stdin)
-            return Fail("HTTP 502") if len(comments) == 1 else ""
-
-        with self.assertRaises(RuntimeError, msg="the step would pass, with the spend lost"):
-            step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": [],
-                              "issue comment": comment}, repo="o/r", pr="7", github_run_id="9",
-                 github_run_attempt="1", gpu_usd="3")
-        self.assertEqual(len(comments), 2, "the ledger write and its alert")
-        self.assertIn("ledger", comments[1], "a lost ledger write would pass silently")
-
-    def test_the_record_step_appends_what_spend_reads_back(self):
-        recorded = {}
-
-        def comment(argv, stdin):
-            recorded["body"] = stdin
-            return ""
-
-        usage = json.dumps({"total_cost_usd": 2.5, "tokens_from": "result", "pr": "7", "head_sha": HEAD, "mode": "full",
-                            "run_id": "9", "run_attempt": "1"})
-        out, fake = step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER], "issue comment": comment}, repo="o/r",
-                         pr="7", github_run_id="9", github_run_attempt="1", usage=usage, gpu_usd="3", box_usd="1.5",
-                         approval="approve")
-        self.assertEqual(self.spend([{"user": {"login": "github-actions[bot]"}, "created_at": "2026-11-08T01:00:00Z",
-                                      "body": recorded["body"]}]), {"day": 7.0, "month": 7.0},
-                         "a run's GPU and box cost would not count toward the cap")
-        self.assertEqual(self.spend_of(recorded["body"]).get("approval"), "approve")
-        self.assertTrue(all(recorded["body"] not in arg for argv, _ in fake.calls for arg in argv),
-                        "the record would reach gh's command line")
-
-    @staticmethod
-    def spend_of(body):
-        return json.loads(base64.b64decode(bot.SPEND.search(body)[1]))
-
-
-class TestCaps(unittest.TestCase):
-    def preflight(self, used, alerts=()):
-        routes = {"GET repos/o/r/collaborators/an-author/permission": {"permission": "write"},
-                  "GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/1/comments*": used,
-                  "GET repos/o/r/issues/2/comments*": list(alerts), "issue comment": "", "pr comment": ""}
-        with mock.patch.object(bot, "utcnow", lambda: NOW):
-            out, fake = step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command="full",
-                             actor="an-author", author="an-author", assoc="MEMBER", skip_label="false")
-        return out, fake.writes()
-
-    def test_past_a_cap_nothing_starts_it_says_so_on_the_pr_and_alerts_once(self):
-        out, writes = self.preflight([spent(10_000.5)])
-        self.assertEqual(out, {"run": "false"}, "a review would start past the day's cap")
-        said = dict(writes)
-        self.assertEqual(sorted(said), ["issue comment", "pr comment"])
-        self.assertIn("daily spend cap ($10,000 of $10,000)", said["pr comment"])
-        self.assertIn("resets at 00:00 UTC", said["pr comment"])
-        marker = said["issue comment"].split("\n")[0]
-        again = [{"user": {"login": "github-actions[bot]"}, "body": f"{marker}\nalready"}]
-        self.assertEqual([k for k, _ in self.preflight([spent(10_000.5)], again)[1]], ["pr comment"],
-                         "every refused request would alert the status issue's subscribers")
-        out, writes = self.preflight([spent(50_000, "2026-11-02T01:00:00Z")])
-        said = dict(writes)
-        self.assertIn("monthly spend cap", said["pr comment"])
-        self.assertIn("resets on the 1st", said["pr comment"])
-        self.assertEqual(self.preflight([spent(9_999)])[0]["run"], "true", "a run under the caps would be refused")
-
-    def test_an_unreadable_ledger_refuses_rather_than_spends(self):
-        with mock.patch.object(bot, "utcnow", lambda: NOW):
-            out, fake = step(bot.preflight, {"GET repos/o/r/collaborators/an-author/permission":
-                                             {"permission": "write"}, "GET repos/o/r/issues[?]*": Fail(),
-                                             "pr comment": ""},
-                             repo="o/r", pr="1", key_set="true", command="light", actor="an-author", author="an-author",
-                             assoc="MEMBER", skip_label="false")
-        self.assertEqual(out, {"run": "false"})
-        self.assertIn("couldn't read its spend ledger", fake.writes()[0][1], "a blind bot could spend past its cap")
+STATUS = {"number": 2, "user": {"login": "github-actions[bot]"}, "body": bot.STATUS_ISSUE + "\nthe status"}
+BOT_AUTHOR = {"__typename": "Bot", "login": "mstar-review"}  # as GraphQL names it
 
 
 class TestMonitor(unittest.TestCase):
@@ -355,13 +219,19 @@ class TestMonitor(unittest.TestCase):
                 found = bot.ci_regressions("o/r", 7, "m", "p")
             self.assertEqual(bool(found), regressed, f"a parent that {parent}")
 
-    def test_an_open_approved_pr_the_merge_queue_threw_out_is_a_signal(self):
-        nodes = [{"createdAt": "2026-11-07T00:00:00Z", "reason": "FAILED_CHECKS"}]
-        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues/8/timeline*": [], "POST graphql": {
-                "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}}})):
-            signals, _ = bot.pr_signals("o/r", {"number": 8, "state": "open"}, [], set())
-        self.assertEqual(signals, [{"key": "8:ejected:2026-11-07T00:00:00Z",
-                                    "text": "`#8` removed from the merge queue (FAILED_CHECKS)"}])
+    @staticmethod
+    def merged_prs(*reviews):
+        """GitHub's answer to the monitor's query, filtering by the query's states as GitHub does: PR 7 with
+        `reviews` and PR 8, the bot's approved too but merged before the window."""
+        def answer(argv, stdin):
+            query = next(a for a in argv if a.startswith("query="))
+            nodes = [{"author": r["author"]} for r in reviews
+                     if "states: APPROVED" not in query or r["state"] == "APPROVED"]
+            return {"data": {"repository": {"pullRequests": {"nodes": [
+                {"number": 7, "mergedAt": "2026-11-01T00:00:00Z", "reviews": {"nodes": nodes}},
+                {"number": 8, "mergedAt": "2026-01-01T00:00:00Z",
+                 "reviews": {"nodes": [{"author": BOT_AUTHOR}]}}]}}}}
+        return answer
 
     def run_monitor(self, body, bug_title="crash in decode", **routes_over):
         calls = {"body": None}
@@ -374,12 +244,11 @@ class TestMonitor(unittest.TestCase):
             return {}
 
         routes = {
-            "GET repos/o/r/issues[?]state=all&creator=*": [LEDGER, STATUS],
-            "GET repos/o/r/issues/1/comments*": [spent(3.0, run="1", approval="approve", pr="7")],
+            "GET repos/o/r/issues[?]state=all&creator=*": [STATUS],
+            "POST graphql": self.merged_prs({"state": "APPROVED", "author": BOT_AUTHOR}),
             "GET repos/o/r/issues/2": issue_status, "PATCH repos/o/r/issues/2": patch, "issue comment": "",
             "GET repos/o/r/pulls/7": {"number": 7, "title": "Faster decode @someone", "state": "closed",
                                       "merged_at": "t", "merge_commit_sha": "d" * 40},
-            "GET repos/o/r/pulls/7/reviews*": [{"state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
             "GET repos/o/r/pulls/7/commits*": [{"sha": "a" * 40}],
             "GET repos/o/r/issues/7/timeline*": [],
             "GET repos/o/r/commits/*/check-runs*": {"check_runs": []},
@@ -389,7 +258,7 @@ class TestMonitor(unittest.TestCase):
             "GET repos/o/r/pulls[?]*": [],
             "git log": (f'{"c" * 40}\x1f{"d" * 40}\x1fRevert "Faster decode (#7)"\x1f\x1e\n'
                         f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
-            "git diff": "a.py\n", "git show": "", "git blame": "", **routes_over,
+            "git diff": "a.py\n", "git show": "", "git blame": "", "GET repos/o/r/labels/*": {}, **routes_over,
         }
         with mock.patch.object(bot, "utcnow", lambda: NOW):
             out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
@@ -397,8 +266,7 @@ class TestMonitor(unittest.TestCase):
 
     def test_new_signals_reach_subscribers_once_and_the_body_is_safe(self):
         body, fake = self.run_monitor(STATUS["body"], bug_title="crash @someone <!-- x in #99")
-        self.assertTrue(body.startswith(bot.issue_marker("status")), "the next run couldn't find the status issue")
-        self.assertIn("$3 of $10,000", body)
+        self.assertTrue(body.startswith(bot.STATUS_ISSUE), "the next run couldn't find the status issue")
         self.assertIn("Approvals: **on**", body)
         comments = [s for k, s in fake.writes() if k == "issue comment"]
         self.assertEqual(len(comments), 1, "a new signal would not notify subscribers")
@@ -410,6 +278,16 @@ class TestMonitor(unittest.TestCase):
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
 
+    def test_the_first_run_creates_the_status_issue_and_the_label(self):
+        created = []
+        body, fake = self.run_monitor(STATUS["body"], **{
+            "GET repos/o/r/issues[?]state=all&creator=*": [],
+            "POST repos/o/r/issues": lambda a, i: created.append(json.loads(i)) or {"number": 2},
+            "GET repos/o/r/labels/*": Fail(), "POST repos/o/r/labels": {}})
+        self.assertTrue(created[0]["body"].startswith(bot.STATUS_ISSUE), "the next run couldn't find it")
+        self.assertIn("Faster decode", body)
+        self.assertIn("POST repos/o/r/labels", [k for k, _ in fake.writes()], "skip-ai-review would be a setup step")
+
     def test_a_failed_post_leaves_the_state_unwritten_so_the_signal_goes_out_tomorrow(self):
         patched = []
         with self.assertRaises(RuntimeError):
@@ -419,18 +297,32 @@ class TestMonitor(unittest.TestCase):
 
     def test_a_pr_that_cant_be_read_is_reported_and_the_rest_goes_on(self):
         reported, _ = self.run_monitor(STATUS["body"])
-        body, _ = self.run_monitor(reported, **{"GET repos/o/r/pulls/7/reviews*": Fail("HTTP 502")})
+        body, _ = self.run_monitor(reported, **{"GET repos/o/r/pulls/7": Fail("HTTP 502")})
         self.assertIn("couldn't read", body)
         self.assertIn("`#7`", body)
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a PR read again after a failed read would re-post its old signals")
 
-    def test_a_dismissed_approval_is_not_one_that_stood(self):
-        body, fake = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": [
-            {"state": "DISMISSED", "user": {"login": "mstar-review[bot]"}}]})
-        self.assertNotIn("Faster decode", body, "a PR whose approval was withdrawn would count as approved")
-        self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
+    def test_only_the_bots_own_live_approval_counts(self):
+        for name, review in (("dismissed", {"state": "DISMISSED", "author": BOT_AUTHOR}),
+                             ("a person with the bot's login", {"state": "APPROVED", "author": {
+                                 "__typename": "User", "login": "mstar-review"}}),
+                             ("another bot", {"state": "APPROVED", "author": {"__typename": "Bot", "login": "ci"}}),
+                             ("a deleted account", {"state": "APPROVED", "author": None})):
+            with self.subTest(name):
+                body, fake = self.run_monitor(STATUS["body"], **{"POST graphql": self.merged_prs(review)})
+                self.assertFalse(any(a.startswith("pr=") for argv, _ in fake.calls for a in argv),
+                                 "the merged-PR query has no pr variable")
+                self.assertNotIn("Faster decode", body, f"{name}: the PR would count as bot-approved")
+                self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
+
+    def test_the_status_issue_is_the_one_a_bot_made_with_the_marker(self):
+        routes = {"GET repos/o/r/issues[?]state=all&creator=*": [
+            {"number": 3, "user": {"login": "a-person"}, "body": STATUS["body"]},
+            {"number": 4, "user": {"login": "github-actions[bot]"}, "body": "<!-- other -->"}, STATUS]}
+        with mock.patch.object(bot, "run", FakeGh(routes)):
+            self.assertEqual(bot.status_issue("o/r")["number"], 2, "a forged issue would become the status issue")
 
 
 class TestRestore(unittest.TestCase):
@@ -452,6 +344,18 @@ class TestRestore(unittest.TestCase):
                 "GET repos/o/r/actions/runs/9": {"path": path, "event": "issue_comment"},
                 "run download": download,
             }, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write)[0]
+
+    def test_a_failure_nobody_expected_is_still_a_refusal(self):
+        fake = FakeGh({
+            "GET repos/o/r/pulls/7": {"head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "title": "t"},
+            "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                 "body": bot.INCOMPLETE + "\nThe review didn't complete"}],
+            "GET repos/o/r/actions/artifacts?*": {"artifacts": [
+                {"expired": False, "created_at": "2026-11-01", "workflow_run": None}]}})
+        out = {}
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(bot, "run", fake), self.assertRaises(TypeError):
+            bot.resolve(out, "o/r", "7", "", temp)
+        self.assertEqual(out["refused"], "true", "it would overwrite the stopped review's comment")
 
     def test_a_continue_takes_only_this_workflows_handoff_of_this_head(self):
         self.assertEqual(self.restore({"mode": "thorough"})["mode"], "nogpu",
@@ -501,6 +405,15 @@ def pr_diff(context, added, index="1111111..2222222"):
             f"@@ -40,2 +40,3 @@ def g():\n     return 1\n+    {added}\n")
 
 
+def configure_review_app(test):
+    """Reimport the bot as it runs with the review app configured, restoring it after `test`."""
+    test.addCleanup(importlib.reload, bot)
+    test.addCleanup(importlib.reload, render_summary)
+    with mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": "app-id"}):
+        importlib.reload(render_summary)
+        importlib.reload(bot)
+
+
 class TestCollect(unittest.TestCase):
     CONVERSATION = {"GET repos/o/r/issues/7/comments": [summary(LAST)]}
 
@@ -509,7 +422,26 @@ class TestCollect(unittest.TestCase):
         self.assertEqual((out.get("rereview"), files["since.diff"]), ("true", "diff --git a/b.py b/b.py\n"))
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
 
-    def test_after_a_rebase_a_re_review_reads_only_the_prs_hunks_that_changed(self):
+    def test_with_the_review_app_only_its_login_is_the_bot(self):
+        forged = {**summary(LAST), "user": {"login": "github-actions[bot]"}}
+        routes = {"GET repos/o/r/issues/7/comments": [forged],
+                  f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")}
+        self.assertEqual(collect(**routes)[0].get("rereview"), "true", "a fork, with no app, would lose re-reviews")
+        configure_review_app(self)
+        self.assertIsNone(collect(**routes)[0].get("rereview"),
+                          "any workflow on a branch could post the state a re-review starts from")
+        inline = {"id": 7, "user": {"login": "github-actions[bot]"}, "body": "**[P1]** drops a token"}
+        files = collect(**{"GET repos/o/r/pulls/7/comments": [inline]})[1]
+        self.assertTrue(json.loads(files["pr-comments.json"])[0]["mine"],
+                        "a team run's inline finding would stop being re-checked")
+        team_run = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [
+            {"author": {"login": "github-actions"}, "databaseId": 7, "body": "**[P1]** drops a token"}]}}
+        pages = [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [team_run]}}}}}]
+        review = {"prior_findings": [], "outside_diff": [], "skipped": []}
+        self.assertEqual(len(render_summary.open_findings(review, pages, [])), 1,
+                         "a team run posts its inline findings as github-actions, and they would stop counting")
+
+    def test_after_a_rebase_a_re_review_reads_only_the_files_that_changed(self):
         reviewed = pr_diff("x = 1", "# unreachable")
         routes = {**self.CONVERSATION, f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("diverged"),
                   f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)}
@@ -518,11 +450,8 @@ class TestCollect(unittest.TestCase):
                              **routes)
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "a rebase that moved the PR's changes would read as new changes")
-        header = "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n--- a/a.py\n+++ b/a.py\n"
-        hunk = "@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # "
         out, files = collect(diff=pr_diff("x = 1", "# dead code"), **routes)
-        self.assertEqual(files["interdiff.diff"],
-                         f"{header}{hunk}dead code\n{bot.DROPPED}{header}{hunk}unreachable\n")
+        self.assertEqual(files["interdiff.diff"], f"{pr_diff('x = 1', '# dead code')}{bot.DROPPED}{reviewed}")
         self.assertNotIn("since.diff", files)
 
     def test_a_merge_in_the_range_takes_the_interdiff(self):
@@ -551,6 +480,11 @@ class TestInterdiff(unittest.TestCase):
         faked_header = self.REVIEWED.replace("+    guard()\n",
                                              "+    guard()\n+    evil()\n+    s = '\fdiff --git a/a.py b/a.py\n")
         below = self.REVIEWED.replace("     z = 4\n", "     w = 5\n")
+        cat = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+        carriage_return = bot.run(cat, input=self.REVIEWED.replace(
+            "+    guard()\n", "+    guard()\n+    evil()\rdiff --git a/a.py b/a.py\n")).stdout
+        type_change = ("diff --git a/l b/l\ndeleted file mode 100644\n--- a/l\n+++ /dev/null\n@@ -1 +0,0 @@\n-{}\n"
+                       "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+t\n")
         for name, old, new, shown in (
                 ("a guard moved to another function", self.REVIEWED, moved, "def h()"),
                 ("a guard moved inside its function", self.REVIEWED, moved_inside, "pass"),
@@ -558,24 +492,33 @@ class TestInterdiff(unittest.TestCase):
                  between_blanks.format("c()", "d()"), "c()"),
                 ("the line below a change", self.REVIEWED, below, "w = 5"),
                 ("a form feed faking a file header", self.REVIEWED, faked_header, "evil()"),
+                ("a carriage return faking a file header", self.REVIEWED, carriage_return, "evil()"),
+                ("the first half of a type change", type_change.format("a"), type_change.format("b"), "-b"),
                 ("a dropped hunk", self.REVIEWED, without_hunk, "def g()"),
                 ("a dropped file", self.REVIEWED + other, self.REVIEWED, "b.py"),
                 ("a mode change beside hunks", self.REVIEWED, mode, "new mode"),
                 ("a binary swapped", binary.format("1..2 100644"), binary.format("1..3 100644"), "1..3")):
             with self.subTest(name):
                 self.assertIn(shown, bot.interdiff(old, new))
+        self.assertIn("evil()\rdiff --git", carriage_return, "a bare \\r would end the line, faking a file header")
+        typed = ("diff --git a/w b/w\ndeleted file mode 120000\nindex 1..0\n--- a/w\n+++ /dev/null\n@@ -1 +0,0 @@\n-t\n"
+                 "diff --git a/w b/w\nnew file mode 100644\nindex 0..{}\nBinary files /dev/null and b/w differ\n")
+        self.assertIn("0..3", bot.interdiff(typed.format("2"), typed.format("3")),
+                      "a binary swapped inside a type change would read as unchanged")
         self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
                          "main changing a binary's old side would read as the PR's change")
+        rename = ("diff --git a/x b/y\nsimilarity index {}%\nrename from x\nrename to y\n--- a/x\n+++ b/y\n"
+                  "@@ -1 +1 @@\n-a\n+b\n")
+        self.assertEqual(bot.interdiff(rename.format(90), rename.format(85)), "",
+                         "a rebase changing how similar a renamed file is would read as the PR's change")
         self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
-        self.assertNotIn(bot.DROPPED, bot.interdiff(self.REVIEWED, mode),
-                         "a mode change beside hunks would list the file as dropped")
 
 
 class TestDispatcher(unittest.TestCase):
     def test_a_step_that_exits_still_writes_its_outputs_with_env_as_parameters(self):
         seen = {}
 
-        def failing(out, pr: int, mode="light"):
+        def failing(out, pr, mode="light"):
             seen.update(pr=pr, mode=mode)
             out["reason"] = "a\nb"
             sys.exit(1)
@@ -584,7 +527,7 @@ class TestDispatcher(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PR": "7", "MODE": "", "GITHUB_OUTPUT": str(output)}), \
                 mock.patch.object(sys, "argv", ["bot.py", "failing"]), self.assertRaises(SystemExit):
             bot.main({"failing": failing})
-        self.assertEqual(seen, {"pr": 7, "mode": "light"})
+        self.assertEqual(seen, {"pr": "7", "mode": "light"})
         self.assertRegex(output.read_text(), r"^reason<<EOF_\w+\na\nb\nEOF_\w+\n$",
                          "the steps after a failed one read what it had found from $GITHUB_OUTPUT")
 
@@ -648,10 +591,10 @@ class TestAfterTheReview(unittest.TestCase):
                 if text:
                     Path(temp, bot.EXECUTION).write_text(text)
                 out, _ = step(bot.usage, {}, pr="1", head_sha="abc", mode="light", outcome="failure", runner_temp=temp,
-                              home=temp, github_run_id="5", github_run_attempt="1", github_step_summary=str(summary))
-                self.assertEqual(json.loads(out["record"])["api_calls"], 0)
+                              home=temp, github_step_summary=str(summary))
+                self.assertNotIn("exit", out)
                 Path(temp, bot.EXECUTION).unlink(missing_ok=True)
-            self.assertTrue(summary.read_text().strip(), "the job summary would have no table")
+            self.assertIn("| API calls | 0 |", summary.read_text(), "the job summary would have no table")
 
     def test_a_run_past_its_turn_cap_still_posts_and_one_out_of_credit_says_so(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -663,6 +606,20 @@ class TestAfterTheReview(unittest.TestCase):
             execution.write_text(json.dumps([{"type": "assistant", "error": "billing_error", "message": {}}]))
             out, fake = step(bot.salvage, {"pr comment": ""}, repo="o/r", pr="7", runner_temp=temp)
             self.assertEqual((out, len(fake.writes())), ({"billing": "true"}, 1))
+
+    def test_a_gpu_ask_above_the_cap_reaches_the_saved_review(self):
+        output = json.dumps({"outside_diff": [], "since_last": "", "description_problems": [], "questions": [],
+                             "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
+                             "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []},
+                             "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}})
+        with workspace():
+            out, fake = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="full", salvaged="false", max_gpus="4")
+        self.assertEqual(json.loads(out["result"])["live_test"]["untestable"], "needs 8 GPUs, runs get 4")
+        self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
 
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
         token = "sk-ant-" + "x" * 30
@@ -678,13 +635,55 @@ class TestAfterTheReview(unittest.TestCase):
                 "PATCH repos/o/r/issues/comments/5": {},
             }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="light", salvaged="true", detail="41 turns")
         (_, posted), (_, resolved) = fake.writes()
-        self.assertEqual(out, {"id": "99"})
+        self.assertEqual(out["id"], "99")
+        self.assertNotIn(token, out["result"], "the raw summary would reach the live-test job unredacted")
         self.assertNotIn(token, posted)
         self.assertIn("leaked [REDACTED]", posted)
         self.assertIn("went past the workflow's turn limit (41 turns)", posted)
         self.assertTrue(json.loads(resolved)["body"].startswith(bot.RESOLVED + "\n"))
         self.assertTrue(all(posted not in arg for argv, _ in fake.calls for arg in argv),
                         "posted text would reach gh's command line")
+
+    def test_the_summary_keeps_the_last_reviews_findings_a_re_review_wasnt_shown(self):
+        item = {"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"}
+        question = {"location": "a.py:1", "text": "Should this be a resource?"}
+        state = {"head": LAST, "mode": "nogpu", "skipped": ["big.py"], "latent": [], "outside_diff": [item],
+                 "questions": [question], "risk": {"level": "medium", "reason": "r", "look_at": []}}
+        partial = f"{render_summary.MARKER}\n<!-- claude-review-state " \
+                  f"{base64.b64encode(json.dumps(state).encode()).decode()} -->"
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}}
+        with workspace():
+            _, fake = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                     "created_at": "t", "body": partial}],
+                "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
+                "GET repos/o/r/pulls/7/comments": [],
+                "GET repos/o/r/pulls/7/reviews*": [],
+            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+        (_, posted), = fake.writes()
+        saved = render_summary.saved_state(posted)
+        self.assertEqual(saved["outside_diff"], [item],
+                         "a run with no last-review.json, or a /review continue, would drop the finding for good")
+        self.assertEqual((saved["questions"], saved["risk"]["level"]), ([question], "medium"),
+                         "post would approve past a question and a risk nobody answered")
+
+    def test_only_write_access_other_than_the_author_answers_an_earlier_review(self):
+        for name, login, perm, body, answered in (("write access", "m", "write", "keep it", True),
+                                                  ("read access, a COLLABORATOR too", "m", "read", "keep it", False),
+                                                  ("the author", "an-author", "admin", "it's fine", False),
+                                                  ("a /review command", "m", "write", "/review nogpu", False)):
+            comment = {"user": {"login": login, "type": "User"}, "body": body, "created_at": "u"}
+            with self.subTest(name), workspace(), mock.patch.object(bot, "run", FakeGh({
+                    "GET repos/o/r/issues/7/comments": [summary(LAST), comment],
+                    "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
+                    "GET repos/o/r/pulls/7/comments": [],
+                    "GET repos/o/r/pulls/7/reviews*": [],
+                    "GET repos/o/r/collaborators/*/permission": {"permission": perm}})):
+                self.assertEqual(bot.earlier_review("o/r", "7")[1], answered)
 
     def test_only_the_fixed_type_labels_reach_the_api(self):
         out, fake = step(bot.labels, {"GET repos/o/r/issues/7/labels": [{"name": "type/docs"}, {"name": "area/x"}],
@@ -718,36 +717,20 @@ class TestImprove(unittest.TestCase):
         with mock.patch.object(bot, "utcnow", lambda: NOW):
             return step(bot.improve_inputs, routes, repo="o/r", key_set="true")
 
-    def test_past_a_cap_nothing_runs(self):
-        # No PR route: reading any evidence would fail the test.
-        routes = {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/1/comments*": [spent(10_000.5)],
-                  "GET repos/o/r/issues/2/comments*": [], "issue comment": ""}
-        with workspace() as d:
-            out, fake = self.inputs(routes)
-            self.assertFalse((d / "improve-evidence").exists(), "evidence was collected past the cap")
-        self.assertEqual(out, {"run": "false"}, "the model would run past the cap")
-
-    def test_a_finished_run_this_week_starts_nothing_and_a_failed_one_can_be_retried(self):
-        routes = {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": []}
-        done = spent(1, mode="improve", usage={"outcome": "success"})
-        with workspace():
-            routes["GET repos/o/r/issues/1/comments*"] = [done]
-            self.assertEqual(self.inputs(routes)[0], {"run": "false"}, "a re-run would pay twice for one week")
-        failed = spent(1, mode="improve", usage={"outcome": "failure"})
-        with workspace():
-            routes["GET repos/o/r/issues/1/comments*"] = [failed]
-            routes["GET repos/o/r/issues/2/comments*"] = [{"user": {"login": "github-actions[bot]"},
-                                                           "html_url": "u", "body": "a signal"}]
-            self.assertEqual(self.inputs(routes)[0]["run"], "true", "a failed run could never be retried")
-
     def test_evidence_keeps_what_a_reader_needs_without_names(self):
         state = base64.b64encode(json.dumps({"moot": [{"ref": "11", "why": "gone"}]}).encode()).decode()
         at, old = "2026-11-07T00:00:00Z", "2026-10-01T00:00:00Z"
         bot_user = {"login": "mstar-review[bot]", "type": "Bot"}
         person = {"login": "a-person", "type": "User"}
         routes = {
-            "GET repos/o/r/issues[?]*": [LEDGER, STATUS],
-            "GET repos/o/r/issues/1/comments*": [spent(3, pr="5", mode="light", run="9", usage={"outcome": "failure"})],
+            "GET repos/o/r/issues[?]state=all&creator=*": [STATUS],
+            "GET repos/o/r/issues/comments*": [
+                {"issue_url": "https://api.github.com/repos/o/r/issues/5", "user": bot_user,
+                 "body": "<!-- claude-review-summary -->\nx"},
+                {"issue_url": "https://api.github.com/repos/o/r/issues/6", "user": person,
+                 "body": "<!-- claude-review-summary -->\nforged"},
+                {"issue_url": "https://api.github.com/repos/o/r/issues/8", "user": bot_user,
+                 "body": "an ordinary comment of the bot's"}],
             "GET repos/o/r/issues/2/comments*": [],
             "GET repos/o/r/pulls/5": {"user": {"login": "a-person"}},
             "GET repos/o/r/pulls/5/reviews*": [],
@@ -775,22 +758,15 @@ class TestImprove(unittest.TestCase):
                          "the old resolved finding, the reply, and not another bot's comment")
         self.assertTrue(e["inline"][0]["resolved"] and not e["inline"][0]["outdated"])
         self.assertEqual([m["why"] for m in e["moot"]], ["gone"])
-        self.assertEqual(e["runs"][0]["outcome"], "failure")
 
-    def post(self, output, usage=""):
-        routes = {"GET repos/o/r/issues[?]*": [LEDGER], "GET repos/o/r/issues/1/comments*": [], "issue comment": "",
-                  "POST repos/o/r/issues": "{}"}
+    def post(self, output):
         with mock.patch.object(bot, "utcnow", lambda: NOW):
-            return step(bot.improve_post, routes, repo="o/r", github_run_id="7", github_run_attempt="1", output=output,
-                        usage=usage)
+            return step(bot.improve_post, {"POST repos/o/r/issues": "{}"}, repo="o/r", output=output)
 
-    def test_an_empty_list_opens_no_issue_and_still_records_the_cost(self):
-        out, fake = self.post('{"improvements": []}', json.dumps({"mode": "improve", "total_cost_usd": 1.5}))
+    def test_an_empty_list_opens_no_issue(self):
+        out, fake = self.post('{"improvements": []}')
         self.assertNotIn("exit", out)
-        writes = fake.writes()
-        self.assertEqual([k for k, _ in writes], ["issue comment"], "an empty week opened an issue")
-        record = json.loads(base64.b64decode(bot.SPEND.search(writes[0][1])[1]))
-        self.assertEqual((record["usd"], record["pr"]), (1.5, ""))
+        self.assertEqual(fake.writes(), [], "an empty week opened an issue")
 
     def test_a_post_is_redacted_on_stdin_with_links_kept_in_the_repository(self):
         secret = "sk-ant-" + "a1b2c3d4" * 3

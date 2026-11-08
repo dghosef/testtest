@@ -52,6 +52,8 @@ jobs:
 
   refresh:
     needs: volumes
+    # Holds ERAS_API_KEY, which a refresh spends: the environment's branch rule keeps it from branch workflows.
+    environment: review-bot
     runs-on: ubuntu-latest
     timeout-minutes: 720
     permissions:
@@ -63,6 +65,7 @@ jobs:
         volume: ${{ fromJSON(needs.volumes.outputs.ids) }}
     env:
       ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
+      SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
       VOLUME: ${{ matrix.volume }}
       MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
       TAG: cache-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -80,24 +83,11 @@ jobs:
           GPUS: ${{ inputs.gpus }}
           HOURS: ${{ inputs.hours }}
         run: |
-          set -o pipefail  # a failed launch fails the step, rather than tail's exit 0 hiding it
-          [ -n "$ERAS_API_KEY" ] || { echo "::error::Set ERAS_API_KEY."; exit 1; }
+          # gpu.py's ledger, for this run only
           echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
           export LIVE_PR_STATE=$RUNNER_TEMP/live-pr
           python3 .github/review/gpu_review.py configure
-          out="$RUNNER_TEMP/lt" && mkdir -p "$out"  # where gpu_review.py wait finds the box
-          jq -n --arg r "$GITHUB_REPOSITORY" --arg s "$(git rev-parse HEAD)" --arg m "$MODELS" --arg k "$SKIP" \
-            --arg w "$WEIGHTS" '{repo: $r, main_sha: $s, models: $m, skip: $k, weights: $w}' > "$out/run.json"
-          S=.claude/skills/live-pr-test/scripts/gpu.py
-          offers=$(python3 "$S" offers --gpus "$GPUS" --json | jq -r --argjson cap "$MAX_USD" \
-            '.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2)) | .id')
-          [ -n "$offers" ] || { echo "::error::No Eras listing with $GPUS GPUs free now."; exit 1; }
-          for offer in $offers; do  # the other refresh job can take a listing first: then the next one
-            python3 "$S" launch "$offer" --pr 0 --hours "$HOURS" --tag "$TAG" --cache-write "$VOLUME" \
-              --allow-over-budget \
-              --run .github/review/refresh_cache_box.sh --input "$out/run.json" | tail -n 1 > "$out/instance" && exit 0
-          done
-          echo "::error::No Eras listing with $GPUS GPUs launched."; exit 1
+          python3 .github/review/gpu_review.py refresh
 
       - name: Wait for it
         timeout-minutes: 700

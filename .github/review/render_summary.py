@@ -4,12 +4,13 @@ The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
 in them. The status line counts the open findings (`open_findings`, which the
 approval rule in gpu_review.py uses too), so a finding from an earlier run counts
-until a later review judges it fixed, fixed above or moot, or a commit changes its
-lines. bot.py passes SCHEMA to the review, posts what `render` makes of its fields,
-and starts a re-review from what `read_state` reads back.
+until a later review judges it fixed, fixed above or moot. bot.py passes SCHEMA to
+the review, posts what `render` makes of its fields, and starts a re-review from
+what `read_state` reads back.
 """
 import base64
 import json
+import os
 import re
 from pathlib import Path
 
@@ -18,15 +19,24 @@ MARKER = "<!-- claude-review-summary -->"
 # What a re-review starts from (head, findings outside the diff, risk, live-test call), base64 JSON,
 # so model text can't close the HTML comment. Read back only from the bot's own comments.
 STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
-# The bot's GraphQL logins: the review app's, and github-actions', which it posted as before the app.
-BOTS = ("mstar-review", "github-actions")
+# Every login the bot posts as: the app, and github-actions, the job's own token, for what the app token
+# can't reach (a team run's inline comments outlast its hour) and everything before the app. Enough for
+# something a forged post can only add to, such as an inline finding.
+POSTING_BOTS = ("mstar-review", "github-actions")
+# Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
+# workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
+BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
-STATUSES = ("fixed", "fixed_above", "open", "moot")
-# Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
-RENAMED_MODES = {"thorough": "nogpu", "gpu": "full"}
+STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
+# disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
+STILL_OPEN = ("open", "disputed")
+# What takes an earlier finding outside the diff out of the state (`carried`).
+CLEARS = ("fixed", "moot")
+# Handoffs saved before the modes were renamed carry the old names (current_mode).
+RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
@@ -107,7 +117,12 @@ SCHEMA = {
                                                           "the change only shows on"},
                 "why": {"type": "string", "description": "one line"},
             }, "required": ["what", "why"]}},
-        }, "required": ["run", "reason", "checks", "gpus", "focus"]},
+            # What the live test can't exercise in this PR; it stops the bot's approval, not the GPU run.
+            "untestable": {"type": "string", "description": "what in this PR the live test cannot exercise: hardware "
+                                                            "other than the GPUs the bot runs on, more GPUs or nodes "
+                                                            "than a run gets, weights or services it cannot get, "
+                                                            "anything else. Short; empty when there is nothing"},
+        }, "required": ["run", "reason", "checks", "gpus", "focus", "untestable"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "latent", "risk"],
@@ -123,45 +138,104 @@ def stacked_above(path):
 def judged(review, stacked):
     """The review's findings as they count. One said to be fixed in a PR stacked above is fixed there only
     when that PR is one of `stacked` (stacked_above); otherwise the claim wasn't checked, and the finding
-    is open and says so."""
-    def unchecked(f):
-        return f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
+    is open and says so. The note is saved with an outside-the-diff item, so a later run doesn't repeat it."""
+    def unchecked(f, text):
+        note = f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
+        return text if note in text else f"{text} {note}"
     return {**review,
             "outside_diff": [f if not f.get("fixed_in") or f["fixed_in"] in stacked else
                              {**{k: v for k, v in f.items() if k != "fixed_in"},
-                              "detail": f"{f['detail']} {unchecked(f)}"} for f in review["outside_diff"]],
+                              "detail": unchecked(f, f["detail"])} for f in review["outside_diff"]],
             "prior_findings": [f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else
-                               {**f, "status": "open", "why": f"{f['why']} {unchecked(f)}"}
+                               {**f, "status": "open", "why": unchecked(f, f["why"])}
                                for f in review.get("prior_findings", [])]}
 
 
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def over_gpu_cap(review, max_gpus):
+    """`review` with `live_test.untestable` naming a GPU count above what a run gets (`max_gpus`): a pass on the
+    smaller box doesn't cover it. Before `carried`, so the saved state keeps it for later reviews."""
+    live = review.get("live_test") or {}
+    gpus, cap = live.get("gpus"), int(max_gpus)
+    note = f"needs {gpus} GPUs, runs get {cap}"
+    if gpus and gpus > cap and note not in (live.get("untestable") or ""):
+        live["untestable"] = "; ".join(x for x in (live.get("untestable"), note) if x)
+    return review
+
+
+def carried(review, earlier, answered):
+    """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
+    outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
+    one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
+    still open loses any `fixed_in` from before); and its risk level as a floor, with the `look_at` that names
+    the decision, and its questions, unless a maintainer other than the author has commented since
+    (`answered`), when this review's judgement stands; and what the live test can't exercise
+    (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no comment makes
+    the bot's GPUs able to run it. Everything here is carried into the next state too."""
+    earlier = earlier or {}
+    verdicts = {f["ref"]: f for f in review["prior_findings"]}
+    locations = {f["location"] for f in review["outside_diff"]}
+
+    def with_verdict(f):
+        verdict = verdicts.get(f["location"])
+        if verdict is None:
+            return f
+        kept = {k: v for k, v in f.items() if k != "fixed_in"}
+        fixed_in = verdict["status"] == "fixed_above" and verdict.get("fixed_in")
+        return {**kept, "fixed_in": fixed_in} if fixed_in else kept
+
+    review = {**review, "outside_diff": [*review["outside_diff"], *[
+        with_verdict(f) for f in earlier.get("outside_diff", []) if f["location"] not in locations
+        and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
+    if not answered:
+        old, new = earlier.get("risk"), review.get("risk")
+        if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
+            review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
+                              "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}
+        asked = {q["text"] for q in review["questions"]}
+        review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
+                                                       if q["text"] not in asked]]
+    untestable = (earlier.get("live_test") or {}).get("untestable")
+    if untestable and not (review.get("live_test") or {}).get("untestable"):
+        review["live_test"] = {**(review.get("live_test") or {}), "untestable": untestable}
+    return review
+
+
 def open_findings(review, pages, stacked):
-    """(where, priority, what) of every open finding: the bot's inline threads, this run's findings outside
-    the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
-    open: only a later review that judged it fixed, fixed above or moot, or a commit that outdated it,
-    clears it. An untagged bot thread counts as a P2, since its priority is unknown and it should still
-    block approval. A finding a PR stacked above fixes isn't open: it lands with that PR, when that PR
-    is one of `stacked` (judged). `pages` are the pages of the PR's review threads (GraphQL)."""
+    """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
+    run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
+    later review judged still open. A thread someone resolved stays open: only a later review that judged
+    it fixed, fixed above or moot clears it. An untagged bot thread counts as a P2, since its priority is
+    unknown and it should still block approval. A finding a PR stacked above fixes isn't open: it lands
+    with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the PR's review
+    threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
-    cleared = {f["ref"] for f in prior if f["status"] != "open"}
-    found, counted = [], set()
+    cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
+    disputed = {f["ref"]: f["why"] for f in prior if f["status"] == "disputed"}
+
+    def what(ref, text):
+        return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
+
+    found, counted = [], {f["location"] for f in review["outside_diff"]}
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
             first = thread["comments"]["nodes"][0]
             ref = str(first.get("databaseId", ""))
-            if thread["isOutdated"] or ref in cleared or not (first["author"] and first["author"]["login"] in BOTS):
+            if ref in cleared or not (first["author"] and first["author"]["login"] in POSTING_BOTS):
                 continue
             match = TAG.match(first["body"])
             where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
             found.append((where, match[1] if match else "P2",
-                          first["body"][match.end() if match else 0:].strip().split("\n")[0]))
+                          what(ref, first["body"][match.end() if match else 0:].strip().split("\n")[0])))
             counted.add(ref)
-    found += [(f"outside the diff, {f['location']}", f["priority"], f["claim"]) for f in review["outside_diff"]
-              if not f.get("fixed_in")]
-    # Judged still open, though its thread went outdated or it was outside the diff.
-    found += [(f"earlier {f['ref']}", f["priority"], f["why"]) for f in prior
-              if f["status"] == "open" and f["ref"] not in counted]
+    found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
+              for f in review["outside_diff"] if not f.get("fixed_in")]
+    # Judged still open, with no thread or outside_diff item here to count it by.
+    found += [(f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
+              if f["status"] in STILL_OPEN and f["ref"] not in counted]
     return found
 
 
@@ -175,14 +249,20 @@ def status(review, pages, head, mode, stacked):
         icon = "🟡"
     else:
         icon = "🟢"
-    fixed_above = sum(f["status"] == "fixed_above" for f in review["prior_findings"]) \
-        + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
+    fixed_above = len(prior_above(review)) + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
     text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No open findings" + (
         f"; {fixed_above} fixed above" if fixed_above else "")
     line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
     if review.get("risk"):
         line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
     return line
+
+
+def prior_above(review):
+    """The earlier findings judged fixed above, but not one `carried` also kept in outside_diff (its row there
+    counts)."""
+    outside = {f["location"] for f in review["outside_diff"]}
+    return [f for f in review["prior_findings"] if f["status"] == "fixed_above" and f["ref"] not in outside]
 
 
 def above(finding):
@@ -197,9 +277,10 @@ def latent(bug):
 
 def checklist(review, pages, stacked, extra=()):
     """The "What's left for you" list: what a human must decide before approving, most important first,
-    one line each with its place: open P0/P1, then `extra` (what the live-test job's rule found), the
-    design decisions, questions, open P2s and skipped files. P3s and latent bugs aren't decisions. Past
-    ten lines the rest fold away, so a question or decision, whose only home this is, is never lost."""
+    one line each with its place: open P0/P1, findings a PR above fixes (merge together), then `extra`
+    (what the live-test job's rule found), the design decisions, questions, open P2s and skipped files. P3s
+    and latent bugs aren't decisions. Past ten lines the rest fold away, so a question or decision, whose
+    only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
     review = judged(review, stacked)
 
@@ -209,7 +290,11 @@ def checklist(review, pages, stacked, extra=()):
     def findings(*priorities):
         return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
 
-    items = [*findings("P0", "P1"), *extra,
+    items = [*findings("P0", "P1"),
+             *[f"**[{f['priority']}]** {f['ref']}: {above(f)}" for f in prior_above(review)],
+             *[f"**[{f['priority']}]** `{f['location']}`: {above(f)}" for f in review["outside_diff"]
+               if f.get("fixed_in")],
+             *extra,
              *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
              *[f"{where(q)}: {q['text']}" for q in review["questions"]],
              *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
@@ -233,16 +318,19 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
+    outside = {f["location"] for f in review["outside_diff"]}
     if prior:
         tally = ", ".join(f"{sum(f['status'] == s for f in prior)} {s.replace('_', ' ')}" for s in STATUSES)
         parts.append(f"Earlier findings: {tally}.")
     sections = [
         ("Still open from earlier", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
-                                     for f in prior if f["status"] == "open"]),
+                                     for f in prior if f["status"] == "open" and f["ref"] not in outside]),
+        ("Disputed: a person decides", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
+                                        for f in prior if f["status"] == "disputed"]),
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
                               for f in review["outside_diff"] if not f.get("fixed_in")]),
         ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
-                                 for f in prior if f["status"] == "fixed_above"]
+                                 for f in prior_above(review)]
          + [f"**[{f['priority']}]** `{f['location']}`: {f['claim']} {above(f)}\n\n  {f['detail']}"
             for f in review["outside_diff"] if f.get("fixed_in")]),
         ("Description", review["description_problems"]),
@@ -258,7 +346,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     if review["skipped"]:
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
     live = review.get("live_test")
-    if live and mode == "full":
+    if live and "run" in live and mode == "full":  # without `run`: only what `carried` kept
         checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
@@ -269,9 +357,11 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
-    risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
+    risk = review.get("risk")
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", []),
+             "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
+             "latent": review.get("latent", []),
+             "questions": review["questions"],
              "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
@@ -279,7 +369,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
 
 
 def current_mode(mode):
-    """`mode` by its current name: summaries and handoffs saved before the modes were renamed carry the old one."""
+    """`mode` by its current name: handoffs saved before the modes were renamed carry the old one."""
     return RENAMED_MODES.get(mode, mode)
 
 
@@ -290,19 +380,16 @@ def saved_state(body):
         state = json.loads(base64.b64decode(found[-1])) if found else None
     except ValueError:
         return None
-    return state if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    return state
 
 
 def read_state(body):
-    """The state a summary comment carries, for a re-review to start from; else None, and that run
-    reviews the whole PR. None too when it doesn't decode and when the earlier review skipped files.
-    Any mode can build on any other, since every mode runs every pass."""
+    """The saved state, when a re-review can build on it; else None, and that run reviews the whole PR. Not
+    when it doesn't decode or the earlier review skipped files. Any mode can build on any other, since every
+    mode runs every pass."""
     state = saved_state(body)
-    if state is None:
-        return None
-    state["mode"] = current_mode(state.get("mode"))
-    # A state without `latent` is from before light mode ran every pass, so it counts as a partial review;
-    # one without `skipped` is older still.
-    if state.get("skipped", [None]) or "latent" not in state:
+    if state is None or state.get("skipped"):
         return None
     return state
