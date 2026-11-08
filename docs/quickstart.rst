@@ -13,7 +13,7 @@ The ``mstar`` CLI launches a server for a model with a sensible default config:
 
    mstar serve bagel
 
-It listens on ``http://localhost:8000`` by default. Other models:
+It listens on ``http://localhost:8000`` by default and runs until you stop it. Other models:
 
 .. code-block:: bash
 
