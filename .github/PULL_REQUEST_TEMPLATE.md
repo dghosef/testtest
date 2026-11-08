@@ -6,7 +6,7 @@
 
 ## How was it tested?
 
-<!-- Commands you ran, or why tests aren't applicable. -->
+<!-- The commands you ran, or why tests aren't applicable. -->
 
 ## Checklist
 - [ ] `ruff check .` passes
