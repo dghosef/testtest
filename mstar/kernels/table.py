@@ -97,7 +97,8 @@ def device_key(device: torch.device | int | None = None) -> DeviceKey | None:
         if device.type != "cuda":
             return None
         device = device.index
-    if not (current_platform.is_cuda() or current_platform.is_rocm()):
+    on_cuda_or_amd_rocm = current_platform.is_cuda() or current_platform.is_rocm()
+    if not on_cuda_or_amd_rocm:
         return None
     return DeviceKey(torch.cuda.get_device_name(device), current_platform.arch(device))
 
