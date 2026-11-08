@@ -615,7 +615,6 @@ Not supported yet: FP8 weights and prefill CUDA graphs.
 Kokoro notes
 ------------
 
-- Kokoro serves on one GPU with ``mstar serve kokoro``.
 - Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
   spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
   this itself on first use when it has network access). ``.[all]`` includes the G2P
@@ -625,7 +624,7 @@ Kokoro notes
   Italian and Portuguese voices; without it those words are skipped and those
   languages are unavailable. Japanese and Mandarin voices need ``misaki[ja]`` /
   ``misaki[zh]``.
-- Serve with ``mstar serve kokoro``. Request knobs: ``voice`` (a bundled voice such
+- Serve with ``mstar serve kokoro`` on one GPU: ``configs/kokoro.yaml`` places its one node on rank 0. Request knobs: ``voice`` (a bundled voice such
   as ``af_heart``, or a blend ``af_bella+af_sky`` / ``af_bella(2)+af_sky(1)``),
   ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
   English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
