@@ -13,3 +13,10 @@ def user_cache_dir() -> Path:
     directory to fall back to."""
     xdg = os.environ.get("XDG_CACHE_HOME", "")
     return Path(xdg) if os.path.isabs(xdg) else Path.home() / ".cache"
+
+
+def cache_subdir(name: str) -> Path:
+    """Return ``name`` under the user's cache root, creating it when missing."""
+    path = user_cache_dir() / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
