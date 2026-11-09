@@ -11,3 +11,5 @@
 ## Checklist
 - [ ] `ruff check .` passes
 - [ ] Added or updated tests / docs where relevant
+
+<!-- Say what you ran and what it showed. -->
