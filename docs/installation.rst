@@ -17,7 +17,7 @@ Requirements
 Install from PyPI
 -----------------
 
-Released versions are on PyPI as ``mstar-ai`` (``mstar-project`` and ``mstar-serve`` are
+Released versions are on PyPI as ``mstar-ai``, the ``name`` in ``pyproject.toml`` (``mstar-project`` and ``mstar-serve`` are
 alias packages that install the same thing). The import package and the console scripts
 are still ``mstar``. We recommend `uv <https://docs.astral.sh/uv/>`_ to create the
 Python 3.12 environment:
