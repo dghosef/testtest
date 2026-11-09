@@ -5,7 +5,7 @@ description: "Install M* and configure model dependencies, accelerators, and ten
 
 ## Requirements {#requirements}
 
-- **Python 3.12+**.
+- **Python 3.12+** (the `requires-python` floor in `pyproject.toml`).
 - **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model families, or **Intel GPUs with XPU PyTorch** for BAGEL (see [Using Docker image on Intel GPU](/installation#using-docker-image-on-intel-gpu)). A CPU-only machine can exercise the graph/worker plumbing in *dummy mode* (submodules return `None`) for development and the modular tests, but not real model inference.
 - Enough GPU memory for the model you intend to serve — several families (e.g. BAGEL-7B, Qwen3-Omni-30B) are multi-GPU-class models.
 
