@@ -74,6 +74,7 @@ class WindowSchedule:
             )
         if context_units < 0:
             raise ValueError(f"context_units must be >= 0, got {context_units}")
+        # Validated above; everything below is window arithmetic on these.
         self.total_units = total_units
         self.window_units = window_units
         self.context_units = context_units
@@ -103,7 +104,7 @@ class WindowSchedule:
         behind the commit frontier. 0 when context is unbounded."""
         if self.context_units == 0:
             return 0
-        return max(0, self.window(index).commit_end - self.context_units)
+        return max(0, self.window(index).commit_start - self.context_units)
 
     def retention(self, tokens_per_unit: int, prefix_tokens: int) -> RetentionPolicy | None:
         """The KV retention a window commit declares for its stream: the
