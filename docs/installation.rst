@@ -4,7 +4,7 @@ Installation
 Requirements
 ------------
 
-- **Python 3.12+** (the ``requires-python`` floor in ``pyproject.toml``).
+- **Python 3.12+** (the ``requires-python`` floor set in ``pyproject.toml``).
 - **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
   families, or **Intel GPUs with XPU PyTorch** for BAGEL
   (see `Using Docker image on Intel GPU`_).
