@@ -66,7 +66,7 @@ class FakeGh:
     def writes(self):
         """(key, stdin) of every call that changes something on GitHub."""
         return [(self.key(argv), stdin) for argv, stdin in self.calls
-                if not self.key(argv).startswith(("GET ", "pr diff", "pr list", "issue list", "run download"))
+                if not self.key(argv).startswith(("GET ", "pr list", "run download"))
                 and not (self.key(argv) == "POST graphql" and not any(a.startswith("query=mutation") for a in argv))]
 
     def __call__(self, argv, input=None, check=True, timeout=None):
@@ -111,10 +111,12 @@ def step(fn, routes, **env):
 
 
 class TestPreflight(unittest.TestCase):
-    def preflight(self, command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
+    def preflight(self, command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR", head="o/r"):
         routes = {f"GET repos/o/r/collaborators/{login}/permission": {"permission": perm}
                   for login, perm in perms.items()}
         routes["pr comment"] = "https://github.com/o/r/pull/1#issuecomment-9"
+        routes["GET repos/o/r/pulls/1"] = {"head": {"repo": head and {
+            "full_name": head, "owner": {"login": head.split("/")[0]}}}}
         out, fake = step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command=command, actor=actor,
                          author=author, assoc=assoc, skip_label="false")
         return out, [stdin for key, stdin in fake.writes()]
@@ -135,6 +137,13 @@ class TestPreflight(unittest.TestCase):
         out, replies = self.preflight("full", {"a-maintainer": "write", "an-author": "read"}, actor="a-maintainer")
         self.assertEqual(out, {"run": "false"}, "a live test could run the code of an author without write access")
         self.assertIn("/review nogpu", replies[0], "the maintainer wouldn't be told what they can run")
+        out, replies = self.preflight("full", {"an-author": "write", "a-stranger": "read"}, head="a-stranger/r")
+        self.assertEqual(out, {"run": "false"}, "a live test could run the code of a fork its owner holds")
+        self.assertIn("/review nogpu", replies[0], "the maintainer wouldn't be told what they can run")
+        self.assertEqual(self.preflight("full", write, head=None)[0], {"run": "false"},
+                         "a head repository GitHub no longer shows would count as trusted")
+        self.assertEqual(self.preflight("full", {"an-author": "write", "a-peer": "write"}, head="a-peer/r"),
+                         ({"run": "true", "mode": "full", "turns": "2000"}, []))
         out, replies = self.preflight("full", read)
         self.assertEqual(out, {"run": "false"}, "a contributor without write access could start a live test")
         self.assertIn("/review light", replies[0], "the contributor wouldn't be told what they can run")
@@ -233,7 +242,7 @@ class TestMonitor(unittest.TestCase):
                  "reviews": {"nodes": [{"author": BOT_AUTHOR}]}}]}}}}
         return answer
 
-    def run_monitor(self, body, bug_title="crash in decode", **routes_over):
+    def run_monitor(self, body, bug_title="crash in decode", app_id="app-id", **routes_over):
         calls = {"body": None}
 
         def issue_status(argv, stdin):
@@ -260,7 +269,8 @@ class TestMonitor(unittest.TestCase):
                         f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
             "git diff": "a.py\n", "git show": "", "git blame": "", "GET repos/o/r/labels/*": {}, **routes_over,
         }
-        with mock.patch.object(bot, "utcnow", lambda: NOW):
+        with mock.patch.object(bot, "utcnow", lambda: NOW), \
+                mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": app_id}):
             out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
         return calls["body"], fake
 
@@ -277,6 +287,10 @@ class TestMonitor(unittest.TestCase):
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
+
+    def test_approvals_read_off_when_no_app_can_approve(self):
+        body, _ = self.run_monitor(STATUS["body"], app_id="")
+        self.assertIn("Approvals: **off**", body, "the status issue would claim approvals are on with no app")
 
     def test_the_first_run_creates_the_status_issue_and_the_label(self):
         created = []
@@ -384,11 +398,11 @@ def collect(mode="light", diff="diff --git a/a.py b/a.py\n", **routes):
         out, _ = step(bot.collect, {
             "GET repos/o/r/pulls/7": {"title": "T", "body": None, "head": {"sha": HEAD, "ref": "x", "repo": None},
                                       "base": {"ref": "main", "sha": BASE, "repo": {"full_name": "o/r"}}},
-            "pr diff": diff,
+            f"GET repos/o/r/compare/{BASE}...{HEAD}": diff,
             "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
             "GET repos/o/r/pulls/7/comments": [],
             "GET repos/o/r/issues/7/comments": [],
-            "issue list": Fail(),
+            "GET repos/o/r/issues?state=open*": Fail(),
             **routes}, repo="o/r", pr="7", head_sha=HEAD, mode=mode)
         return out, {p.name: p.read_text() for p in ws.iterdir()}
 
@@ -463,6 +477,28 @@ class TestCollect(unittest.TestCase):
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "what the merge brought in from main would be reviewed as the author's change")
         self.assertNotIn("since.diff", files)
+
+
+class TestFullModeInputs(unittest.TestCase):
+    def test_only_the_teams_and_bots_text_reaches_the_review_that_steers_the_box(self):
+        def comment(user, assoc):
+            return {"id": 1, "user": {"login": user}, "author_association": assoc, "body": user}
+
+        routes = {"GET repos/o/r/pulls/7/comments": [comment("a-stranger", "NONE"), comment("a-member", "MEMBER")],
+                  "GET repos/o/r/issues/7/comments": [comment("github-actions[bot]", "NONE"),
+                                                      comment("a-contributor", "CONTRIBUTOR")],
+                  "GET repos/o/r/issues?state=open*": [
+                      {"number": 1, "title": "stranger's", "author_association": "NONE"},
+                      {"number": 2, "title": "team's", "author_association": "OWNER"},
+                      {"number": 3, "title": "a PR", "author_association": "OWNER", "pull_request": {}}]}
+        full, light = collect("full", **routes)[1], collect("light", **routes)[1]
+        self.assertEqual([c["user"] for c in json.loads(full["pr-comments.json"])], ["a-member"])
+        self.assertEqual([c["user"] for c in json.loads(full["pr-conversation.json"])], ["github-actions[bot]"],
+                         "the bot's own comments, which a re-review judges, must stay")
+        self.assertEqual(json.loads(full["open-issues.json"]), [{"number": 2, "title": "team's"}])
+        self.assertEqual([c["user"] for c in json.loads(light["pr-conversation.json"])],
+                         ["github-actions[bot]", "a-contributor"], "other modes read everything")
+        self.assertEqual([i["number"] for i in json.loads(light["open-issues.json"])], [1, 2])
 
 
 class TestInterdiff(unittest.TestCase):
@@ -582,6 +618,16 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(fresh["runs"], 1, "a corrupt earlier handoff would stop this one being saved")
         self.assertEqual(self.handoff(None)[0], {"exit": "No Claude Code messages to hand off."})
 
+    def test_what_a_stopped_review_posts_is_inert(self):
+        partial = self.handoff([
+            assistant(call("c1", path="a.py", line=3, body="**[P2]** @org/team ![x](https://x.example/a.png)")),
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+                                                       "content": '{"comment_id": 1}'}]}},
+        ])[3]
+        self.assertIn("`a.py:3` **[P2]**", partial)
+        for markup in ("@org", "![", "]("):
+            self.assertNotIn(markup, partial, "the model's text would ping a team or load an image from the comment")
+
 
 class TestAfterTheReview(unittest.TestCase):
     def test_a_corrupt_or_missing_execution_file_still_records_usage(self):
@@ -607,6 +653,9 @@ class TestAfterTheReview(unittest.TestCase):
             out, fake = step(bot.salvage, {"pr comment": ""}, repo="o/r", pr="7", runner_temp=temp)
             self.assertEqual((out, len(fake.writes())), ({"billing": "true"}, 1))
 
+    def test_the_threads_query_asks_when_a_finding_was_edited(self):
+        self.assertIn("lastEditedAt", bot.THREADS, "an edited finding would read as the bot's own text")
+
     def test_a_gpu_ask_above_the_cap_reaches_the_saved_review(self):
         output = json.dumps({"outside_diff": [], "since_last": "", "description_problems": [], "questions": [],
                              "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
@@ -614,11 +663,16 @@ class TestAfterTheReview(unittest.TestCase):
                              "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}})
         with workspace():
             out, fake = step(bot.post, {
-                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                    {"comments": {"nodes": [{"databaseId": 4, "author": {"login": "mstar-review"},
+                                             "body": "**[P1]** x"}]}},
+                ]}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
                 "GET repos/o/r/issues/7/comments": [],
             }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="full", salvaged="false", max_gpus="4")
         self.assertEqual(json.loads(out["result"])["live_test"]["untestable"], "needs 8 GPUs, runs get 4")
+        self.assertEqual(json.loads(out["result"])["inline"], {"4": "P1"},
+                         "a later step couldn't tell an edited finding")
         self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
 
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
@@ -792,11 +846,12 @@ class TestImprove(unittest.TestCase):
         for text in ("![x](https&colon;&sol;&sol;evil.example/x.png)", "![w](https:\\/\\/evil.example/x.png)",
                      "[w](/\\/evil.example)", "[z](http:evil.example/x)", "&commat;someone", "&num;99", "@someone",
                      "#99", "<!-- x", "<img src=x>", "GH-5", "gh-5", "_GH-123_", "https://github.com/o/r/issues/5",
-                     "![x](https://evil.example/x.png)", "www.evil.example", "_www.evil.example_"):
+                     "![x](https://evil.example/x.png)", "www.evil.example", "_www.evil.example_",
+                     "[a]: //evil.example/x"):
             for fn in (bot.safe, bot.scrub):
                 with self.subTest(text, fn=fn.__name__):
                     out = fn(text)
-                    self.assertNotRegex(out, r"(?i)\]\(|!\[|://|gh-|www\.", "it would render or mark a timeline")
+                    self.assertNotRegex(out, r"(?i)\][(:]|!\[|://|gh-|www\.", "it would render or mark a timeline")
                     self.assertNotRegex(out, "[@#<&\\\\](?!\u200b)", "it would ping, open markup or spell another")
                     self.assertEqual(bot.safe(bot.safe(text)), bot.safe(text), "a second pass would change it")
 

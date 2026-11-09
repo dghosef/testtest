@@ -38,6 +38,10 @@ CLEARS = ("fixed", "moot")
 # Handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
+# The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
+# `#` not before a space or another `#`: those are a Markdown heading, which links nothing.
+MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=[(:])|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
+                    r"(?!\u200b)")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
     "type": "object",
@@ -129,6 +133,22 @@ SCHEMA = {
 }
 
 
+def inert(value):
+    """Untrusted text, or the strings in a list or dict of it, with a zero-width space after the first character of
+    every `@`, `#`, `<`, `&`, `\\`, `](`, `]:`, `![`, `://`, `GH-` and `www.`, in any case. (`#` before whitespace,
+    another `#` or the end of the text is left alone: that's a heading or plain, and can't reference anything.) So it
+    can't ping anyone, mark another issue's timeline, link (inline or by a reference definition), load an image, open
+    HTML or a comment, or spell any of those as an entity or a backslash escape. Nothing is escaped, so text in a code
+    span still reads right and a second pass changes nothing."""
+    if isinstance(value, str):
+        return MARKUP.sub("\\g<0>\u200b", value)
+    if isinstance(value, list):
+        return [inert(v) for v in value]
+    if isinstance(value, dict):
+        return {k: inert(v) for k, v in value.items()}
+    return value
+
+
 def stacked_above(path):
     """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
     bot.collect leaves out when a fetch failed. [] without it."""
@@ -203,14 +223,35 @@ def carried(review, earlier, answered):
     return review
 
 
+def bot_threads(pages):
+    """(first comment, priority, text after the tag) of every inline thread the bot started, a page of the PR's review
+    threads (GraphQL) at a time. An untagged one counts as a P2, since its priority is unknown and it should still
+    block approval."""
+    for page in pages:
+        for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+            first = thread["comments"]["nodes"][0]
+            if first["author"] and first["author"]["login"] in POSTING_BOTS:
+                match = TAG.match(first["body"])
+                yield first, match[1] if match else "P2", first["body"][match.end() if match else 0:]
+
+
+def inline_findings(pages):
+    """The bot's inline findings as they stand, comment id to priority tag, what a later step checks them against
+    (gpu_review.findings_changed)."""
+    return {str(first.get("databaseId", "")): priority for first, priority, _ in bot_threads(pages)}
+
+
+EDITED = "edited after the bot posted it; a person decides"
+
+
 def open_findings(review, pages, stacked):
     """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
     run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
     later review judged still open. A thread someone resolved stays open: only a later review that judged
-    it fixed, fixed above or moot clears it. An untagged bot thread counts as a P2, since its priority is
-    unknown and it should still block approval. A finding a PR stacked above fixes isn't open: it lands
-    with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the PR's review
-    threads (GraphQL)."""
+    it fixed, fixed above or moot clears it. A bot thread someone edited counts as an open P0, whatever a
+    later review judged, since the text the review read isn't the bot's. A finding a PR stacked above fixes
+    isn't open: it lands with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the
+    PR's review threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
@@ -220,17 +261,15 @@ def open_findings(review, pages, stacked):
         return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
 
     found, counted = [], {f["location"] for f in review["outside_diff"]}
-    for page in pages:
-        for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            first = thread["comments"]["nodes"][0]
-            ref = str(first.get("databaseId", ""))
-            if ref in cleared or not (first["author"] and first["author"]["login"] in POSTING_BOTS):
-                continue
-            match = TAG.match(first["body"])
-            where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
-            found.append((where, match[1] if match else "P2",
-                          what(ref, first["body"][match.end() if match else 0:].strip().split("\n")[0])))
-            counted.add(ref)
+    for first, priority, text in bot_threads(pages):
+        ref = str(first.get("databaseId", ""))
+        edited = first.get("lastEditedAt")
+        if ref in cleared and not edited:
+            continue
+        where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
+        found.append((where, "P0", EDITED) if edited
+                     else (where, priority, what(ref, text.strip().split("\n")[0])))
+        counted.add(ref)
     found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
               for f in review["outside_diff"] if not f.get("fixed_in")]
     # Judged still open, with no thread or outside_diff item here to count it by.
@@ -241,7 +280,7 @@ def open_findings(review, pages, stacked):
 
 def status(review, pages, head, mode, stacked):
     found = [p for _, p, _ in open_findings(review, pages, stacked)]
-    review = judged(review, stacked)
+    review = inert(judged(review, stacked))
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -282,27 +321,28 @@ def checklist(review, pages, stacked, extra=()):
     and latent bugs aren't decisions. Past ten lines the rest fold away, so a question or decision, whose
     only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
-    review = judged(review, stacked)
+    review = inert(judged(review, stacked))
 
     def where(item):
         return f"`{item['location']}`" if item.get("location") else "(PR-wide)"
 
     def findings(*priorities):
-        return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
+        return [f"**[{p}]** `{inert(w)}`: {inert(what)}"
+                for wanted in priorities for w, p, what in found if p == wanted]
 
     items = [*findings("P0", "P1"),
              *[f"**[{f['priority']}]** {f['ref']}: {above(f)}" for f in prior_above(review)],
              *[f"**[{f['priority']}]** `{f['location']}`: {above(f)}" for f in review["outside_diff"]
                if f.get("fixed_in")],
-             *extra,
+             *inert(list(extra)),
              *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
              *[f"{where(q)}: {q['text']}" for q in review["questions"]],
              *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
     title = "#### What's left for you"
     if not items:
         return f"{title}\nNothing left from the review."
-    # Model text and file names: kept to one line, and unable to open an HTML comment.
-    lines = [f"- [ ] {' '.join(str(item).split()).replace('<!--', '&lt;!--')}" for item in items]
+    # Model text and file names: kept to one line (`inert` above, so unable to open an HTML comment).
+    lines = [f"- [ ] {' '.join(str(item).split())}" for item in items]
     text = "\n".join([title, *lines[:10]])
     if lines[10:]:
         rest = "\n".join(lines[10:])
@@ -314,7 +354,8 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above).
     `salvaged`: the review went past its turn limit, so the action failed it and no live test follows."""
     parts = ["### Automated review", status(review, pages, head, mode, stacked)]
-    review = judged(review, stacked)
+    raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
+    review = inert(raw)
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
@@ -351,20 +392,21 @@ def render(review, pages, head, mode, stacked, salvaged=False):
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
-    left = checklist(review, pages, stacked)
+    left = checklist(raw, pages, stacked)
     parts.append(f"{left} The live-test comment adds its own items." if mode == "full" and not salvaged else left)
     # Only full mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
-    risk = review.get("risk")
-    state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
+    risk = raw.get("risk")
+    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": raw["outside_diff"],
              "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
-             "latent": review.get("latent", []),
-             "questions": review["questions"],
-             "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
-    # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
-    text = "\n\n".join(parts).replace("<!--", "&lt;!--")
+             "latent": raw.get("latent", []),
+             "questions": raw["questions"],
+             "live_test": raw.get("live_test"),
+             "moot": [f for f in raw.get("prior_findings", []) if f["status"] == "moot"]}
+    # `inert` keeps model text from opening an HTML comment, so it can't forge a marker this bot or the workflow reads.
+    text = "\n\n".join(parts)
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 

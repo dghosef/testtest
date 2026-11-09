@@ -16,7 +16,9 @@ name: Claude Review
 #      or execute anything from it. The PR's tree goes in pr-head/ and is read
 #      only. There is no setup-python, no pip, no cargo, no make.
 #   2. persist-credentials: false on both checkouts, so no token is written into
-#      a working tree the PR controls.
+#      a working tree the PR controls. The action does write this job's token
+#      into the root checkout's .git/config, so the review step's settings deny
+#      the model reads of .git.
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
@@ -59,8 +61,9 @@ name: Claude Review
 #     team plus anyone who has had a PR merged here, from a fork or not;
 #   - nogpu, when someone with write access comments `/review nogpu`;
 #   - full, when someone with write access comments `/review` on a PR whose
-#     author also has write access: nogpu, then the live test, then approval
-#     if the rule holds.
+#     author also has write access and whose head is on this repository or a
+#     fork owned by someone with write access: nogpu, then the live test, then
+#     approval if the rule holds.
 #     A `/review` or `/review nogpu` that lacks the write access it takes gets a
 #     one-line reply and nothing runs: a contributor without it, on their own
 #     PR, is pointed to `/review light`; a `/review` on a PR whose author lacks
@@ -122,6 +125,9 @@ jobs:
   # group, so a refused or unrelated request never cancels a review in progress.
   preflight:
     name: Preflight
+    # The key check below reads ANTHROPIC_API_KEY, which is in the environment. (The job's `if` runs first,
+    # so an unrelated comment makes no deployment.)
+    environment: review-bot
     # No repository pin: a fork with no ANTHROPIC_API_KEY exits green at the
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
@@ -168,14 +174,15 @@ jobs:
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
-      # continue`; a full review also needs an author with write access (see the
-      # header). A request that fails only those checks gets a one-line reply;
+      # continue`; a full review also needs an author and head repository with
+      # write access (see the header). A request that fails only those checks gets a one-line reply;
       # anyone else exits green with a notice (bot.py, preflight).
       - name: Preflight
         id: pre
         env:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-          ACTOR: ${{ github.actor }}
+          # Who pressed the button on a re-run; `github.actor` stays the original commenter.
+          ACTOR: ${{ github.triggering_actor }}
           AUTHOR: ${{ github.event.issue.user.login }}
           # The commenter's association; a self-serve run also requires commenter == author.
           ASSOC: ${{ github.event.comment.author_association }}
@@ -210,7 +217,7 @@ jobs:
       mode: ${{ steps.pr.outputs.mode }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
-      # The summary's fields as `post` rendered them, with what it carried over from the earlier review.
+      # The summary's fields as `post` rendered them, with what it carried over and this run's inline findings.
       result: ${{ steps.post.outputs.result }}
       # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
       rereview: ${{ steps.diff.outputs.rereview }}
@@ -328,8 +335,10 @@ jobs:
           allowed_non_write_users: ${{ needs.preflight.outputs.non_write_user }}
           # Reads stay inside the checkout (main at the root, the PR in pr-head/), so the model
           # can't read the runner's files, and with --permission-mode dontAsk below any call
-          # that would otherwise prompt is refused.
-          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+          # that would otherwise prompt is refused. No .git: the action writes this job's token
+          # into the root checkout's .git/config. `.git` is the directory itself (Grep and Glob
+          # are checked against the directory they search), `//` an absolute path.
+          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true,"deny":["Read(.git)","Read(.git/**)","Read(//**/.git/**)"]}}'
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, inputs and output format, and points
@@ -516,15 +525,16 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables; the ssh key every box is reached with from a
-      # secret, and each node's host and pinned host key from REVIEW_SLURM_NODES. The key stays on
-      # the runner: it never reaches the box.
+      # gpu.py's settings, from repository variables. From secrets: the ssh key every box is reached
+      # with, and REVIEW_SLURM_NODES, each node's host and pinned host key (a step's env: is printed to
+      # the public log before the step runs, so it can't mask a variable in time). The key stays on the
+      # runner: it never reaches the box.
       - name: Configure the GPUs
         env:
           SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
-          SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
+          SLURM_NODES: ${{ secrets.REVIEW_SLURM_NODES }}
           SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
-          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENTER: ${{ github.triggering_actor }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
@@ -598,7 +608,7 @@ jobs:
           S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
-          NODES: ${{ vars.REVIEW_SLURM_NODES }}
+          NODES: ${{ secrets.REVIEW_SLURM_NODES }}
         run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this
