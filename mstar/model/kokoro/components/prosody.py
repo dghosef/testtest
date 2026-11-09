@@ -132,7 +132,7 @@ class ProsodyPredictor(nn.Module):
         unscaled_duration = torch.sigmoid(self.duration_proj(x)).sum(dim=-1)
         # A higher speed means fewer frames per phoneme.
         duration = unscaled_duration / speed[:, None]
-        # Every phoneme keeps at least one frame, however fast the speech.
+        # Every real phoneme keeps at least one frame, however fast the speech; the padded tail goes to 0 below.
         pred_dur = torch.round(duration).clamp(min=1).long()
         return pred_dur.masked_fill(~length_mask(lengths, d.shape[1]), 0)
 
