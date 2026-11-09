@@ -22,10 +22,10 @@ STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
 # Every login the bot posts as: the app, and github-actions, the job's own token, for what the app token
 # can't reach (a team run's inline comments outlast its hour) and everything before the app. Enough for
 # something a forged post can only add to, such as an inline finding.
-POSTING_BOTS = ("mstar-review", "github-actions")
+POSTING_BOTS = ("dghosef-review-test", "github-actions")
 # Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
 # workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
-BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
+BOTS = ("dghosef-review-test",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
