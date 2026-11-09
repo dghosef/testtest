@@ -1,7 +1,7 @@
 Quickstart
 ==========
 
-This page serves a model and sends a first request. If you haven't installed ``mstar``
+This page starts a server for a model and sends a first request. If you haven't installed ``mstar``
 yet, see :doc:`installation`.
 
 1. Start a server
