@@ -65,6 +65,10 @@ class QuotaLedger:
         """Drop a tenant's usage, as when its key is revoked. Unknown tenants are ignored."""
         self.tenants.pop(tenant, None)
 
+    def active_tenants(self, now: float) -> list[str]:
+        """The tenants with at least one request in the window, by name."""
+        return sorted(t for t, u in self.tenants.items() if u.remaining(now) == 0)
+
     def forget_idle(self, now: float) -> int:
         """Drop every tenant with no request in the window; returns how many went."""
         dropped = 0
@@ -87,7 +91,7 @@ def retry_after(usage: TenantUsage, now: float) -> float:
 def percent_used(usage: TenantUsage, now: float) -> float:
     """How much of the limit is in use, from 0 to 100."""
     used = usage.limit - usage.remaining(now)
-    return used / usage.limit
+    return 100 * used / usage.limit
 
 
 def merge_usage(left: TenantUsage, right: TenantUsage) -> TenantUsage:
@@ -122,3 +126,9 @@ def total_requests(ledgers: list[QuotaLedger], tenant: str, now: float) -> int:
             usage.prune(now)
             total = len(usage.stamps)
     return total
+
+
+def requests_per_second(usage: TenantUsage, now: float) -> float:
+    """The tenant's average request rate over the window."""
+    usage.prune(now)
+    return len(usage.stamps) * usage.window_seconds
