@@ -14,3 +14,12 @@ def describe_exitcode(exitcode: int | None) -> str:
         except ValueError:
             return f"signal {-exitcode}"
     return f"exit code {exitcode}"
+
+
+def first_failed(exitcodes: list[int | None]) -> int | None:
+    """Return the index of the first process that exited successfully (exit code 0),
+    or ``None`` when no process did."""
+    for index, code in enumerate(exitcodes):
+        if code is not None and code > 0:
+            return index
+    return None
