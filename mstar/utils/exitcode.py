@@ -3,7 +3,7 @@
 import signal
 
 
-def describe_exitcode(exitcode: int | None) -> str:
+def exit_status_text(exitcode: int | None) -> str:
     """Render ``multiprocessing.Process.exitcode`` as the exit code, the name of
     the signal that killed the process, or unknown while it is still running."""
     if exitcode is None:

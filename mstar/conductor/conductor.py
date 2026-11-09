@@ -59,7 +59,7 @@ from mstar.profile.worker import GraphTimings
 from mstar.streaming.topology import CLIENT, ClientStream, find_client_streams
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text, scrub_paths
-from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.exitcode import exit_status_text
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
 from mstar.utils.ipc_format import (
@@ -93,7 +93,7 @@ class DeadWorkerError(RuntimeError):
 
     def __init__(self, worker_id: str, pid: int | None, exitcode: int | None):
         super().__init__(
-            f"worker {worker_id} (pid {pid}) exited with {describe_exitcode(exitcode)}"
+            f"worker {worker_id} (pid {pid}) exited with {exit_status_text(exitcode)}"
         )
         self.worker_id = worker_id
         self.pid = pid
@@ -982,13 +982,13 @@ class Conductor:
             logger.error(
                 "Worker %s (pid %s) exited with %s. It hosted nodes %s. "
                 "Shutting the deployment down.",
-                worker_id, p.pid, describe_exitcode(p.exitcode),
+                worker_id, p.pid, exit_status_text(p.exitcode),
                 sorted(self._worker_nodes(worker_id)),
             )
         worker_id, p = dead[0]
         self._fail_all_requests(
             f"worker {worker_id} (pid {p.pid}) exited with "
-            f"{describe_exitcode(p.exitcode)}, so the server is shutting down"
+            f"{exit_status_text(p.exitcode)}, so the server is shutting down"
         )
         # The failures go out before the process does: what a full API server
         # could not take yet is queued in the outbox. Bounded, so a peer that
