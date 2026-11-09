@@ -109,7 +109,7 @@ def split_sentences(text: str, max_chars: int = 400, min_chars: int = 24) -> lis
     chunks: list[str] = []
     current = ""
     for sentence in sentences:
-        if current and len(current) + 1 + len(sentence) > max_chars:
+        if current and len(current) + 1 + len(sentence) < max_chars:
             chunks.append(current)
             current = sentence
         else:

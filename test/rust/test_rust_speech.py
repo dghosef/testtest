@@ -269,7 +269,7 @@ def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypa
     edge cases: terminators with and without closers, CJK ends, paragraph
     breaks, clause marks, runs with no spaces, combining marks, and Python's
     whitespace (U+001C and U+00A0 among it)."""
-    from mstar.api_server.openai.speech_chunking import split_sentences
+    from mstar.api_server.openai.text_chunking import split_sentences
 
     words = ["word", "longerword", "3.5", "end.", 'quote."', "aside!)", "really?'", "semi;", "海は広い。",
              "質問？", "clause,", "colon:", "，中文", "\n\n", "\n \t\n", " ", "\u001c", "áb́",

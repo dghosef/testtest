@@ -7,7 +7,7 @@ the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.
 ``/v1/audio/voices`` lists the ``voice`` values the served model accepts.
 
 Long inputs can be synthesized as ordered sentence chunks (one engine request
-per chunk, ``speech_chunking.split_sentences``): the adapter's
+per chunk, ``text_chunking.split_sentences``): the adapter's
 ``speech_chunk_min_chars`` turns this on for long texts, and a client can force
 or suppress it per request with ``sentence_chunking: true|false``. The next
 chunks are submitted while the current one streams, so the engine batches them
@@ -35,7 +35,7 @@ from fastapi.responses import Response
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import release_unread, rid
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
-from mstar.api_server.openai.speech_chunking import split_sentences
+from mstar.api_server.openai.text_chunking import split_sentences
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.utils.generation_kwargs import offset_seed
 
@@ -51,7 +51,7 @@ def _plan_chunks(req, adapter, text: str) -> list[str]:
     if requested is False or (requested is None and (min_chars is None or len(text) < min_chars)):
         return [text]
     split = getattr(adapter, "split_speech_text", None)
-    chunks = split(text) if split else split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
+    chunks = split(text) if split else split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 0))
     max_pieces = getattr(adapter, "speech_chunk_max_pieces", 32)
     if len(chunks) > max_pieces:
         raise HTTPException(
