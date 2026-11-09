@@ -151,6 +151,12 @@ def graphql(query, repo, pr=None):
                "-f", f"query={query}")
 
 
+def log_value(value):
+    """Untrusted `value` for a log line, where it can't run a workflow command: on one line, as JSON (a newline would
+    start a new command), and without `##[`, which the runner's older command parser finds anywhere in a line."""
+    return json.dumps(value).replace("##[", "# #[")
+
+
 def write(path, text):
     """Write `text` as `gh` printed it, bytes that aren't UTF-8 included."""
     Path(path).write_text(text, encoding="utf-8", errors="surrogateescape")
@@ -300,7 +306,7 @@ def reply(repo, pr, text):
     try:
         comment(repo, pr, text)
     except RuntimeError as e:
-        print(f"::warning::Couldn't reply: {e}")
+        print(f"::warning::Couldn't reply: {log_value(str(e))}")
 
 
 # ---------------------------------------------------------------- review job: before the review
@@ -311,7 +317,7 @@ def react(out, repo, comment_id):
     try:
         gh("api", "-X", "POST", f"repos/{repo}/issues/comments/{comment_id}/reactions", "-f", "content=eyes")
     except RuntimeError as e:
-        print(f"::warning::Couldn't react to the comment: {e}")
+        print(f"::warning::Couldn't react to the comment: {log_value(str(e))}")
 
 
 def resolve(out, repo, pr, mode, runner_temp, non_write=""):
@@ -470,14 +476,14 @@ DROPPED = "=== dropped since the last review: these files as they were at the la
 
 def interdiff(old, new):
     """What differs between `old`, a PR's diff at the last review, and `new`, its diff now: each file that
-    differs, compared with line numbers stripped, as `new` has it and, after DROPPED, as `old` had it;
-    files only on one side appear on that side. Empty means the PR's own changes are the same, whatever
-    a rebase moved around them. Coarse by design: a re-review after a rebase can read a whole file's
-    patch when only part of it changed."""
+    differs, compared with line numbers stripped, as `new` has it, numbered as pr.diff is, and, after DROPPED,
+    as `old` had it, unnumbered as nothing there can be commented on; files only on one side appear on that
+    side. Empty means the PR's own changes are the same, whatever a rebase moved around them. Coarse by design:
+    a re-review after a rebase can read a whole file's patch when only part of it changed."""
     before, after = file_patches(old), file_patches(new)
     changed = [f for f in after if patch_key(after[f]) != patch_key(before.get(f, []))]
     dropped = [f for f in before if patch_key(before[f]) != patch_key(after.get(f, []))]
-    text = "".join(line for f in changed for line in after[f])
+    text = session.numbered("".join(line for f in changed for line in after[f]))
     return text + (DROPPED + "".join(line for f in dropped for line in before[f]) if dropped else "")
 
 
@@ -509,7 +515,8 @@ def discussion(repo, pr):
 
 
 def collect(out, repo, pr, head_sha, mode, prev=""):
-    """The review's inputs, in the workspace: pr.diff, pr-body.md, pr-comments.json (with each thread's
+    """The review's inputs, in the workspace: pr.diff (its hunks numbered, session.numbered), pr-body.md,
+    pr-comments.json (with each thread's
     resolved and outdated state, and `mine` on the bot's own), pr-conversation.json, a re-review's
     last-review.json with since.diff and since-commits.txt or interdiff.diff (rereview_inputs),
     stacked-above.json and above-<n>.diff, and open-issues.json; and the diff's length and the summary's
@@ -523,7 +530,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     # (GitHub can give up on generating a very large one) fails this step: the review reports it didn't run.
     diff = gh("api", "-H", "Accept: application/vnd.github.diff",
               f"repos/{repo}/compare/{pull['base']['sha']}...{head_sha}").stdout
-    write("pr.diff", diff)
+    write("pr.diff", session.numbered(diff))
     write("pr-body.md", (pull["body"] or "") + "\n")
 
     comments, conversation = discussion(repo, pr)
@@ -569,7 +576,7 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
     if listing is not None:
         r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
         if r.returncode == 0:
-            write("since.diff", r.stdout)
+            write("since.diff", session.numbered(r.stdout, left=False))
             write("since-commits.txt", listing)
     elif last:
         # The PR's diff at that commit: from where it forked from the base branch.
@@ -646,6 +653,24 @@ def write_open_issues(repo, mode):
 
 # ---------------------------------------------------------------- review job: after the review
 
+def last_result(messages):
+    """The final `result` message of an execution file's messages, {} when there is none."""
+    return ([m for m in messages if m.get("type") == "result"] or [{}])[-1]
+
+
+def returned(result):
+    """What a `result` message returned, when the run finished and returned a review; otherwise None."""
+    output = result.get("structured_output")
+    ok = result.get("subtype") == "success" and result.get("is_error") in (None, False) and isinstance(output, dict)
+    return output if ok else None
+
+
+def finished_review(runner_temp):
+    """The review a finished run returned, from the action's execution file; None if it returned none. Read here,
+    not passed through an env var: the kernel refuses to start a step with one over about 128 KB, which a review with
+    many inline findings can pass, and the finished review would be lost."""
+    return returned(last_result(json.loads(Path(runner_temp, EXECUTION).read_text())))
+
 
 def salvage(out, repo, pr, runner_temp):
     """The action fails a run that went past --max-turns even when Claude finished and returned its
@@ -668,10 +693,10 @@ def salvage(out, repo, pr, runner_temp):
         out["billing"] = "true"
         comment(repo, pr, "The review didn't run: the API account for the review bot is out of credit.")
         return
-    result = ([m for m in messages if m.get("type") == "result"] or [{}])[-1]
+    result = last_result(messages)
     out["detail"] = f"{result.get('num_turns', '?')} turns"
-    output = result.get("structured_output")
-    if result.get("subtype") == "success" and result.get("is_error") in (None, False) and isinstance(output, dict):
+    output = returned(result)
+    if output is not None:
         out["structured_output"] = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
     else:
         out["why"] = {"error_max_turns": "it ran out of turns",
@@ -689,7 +714,7 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_step_summa
         record.update(session.usage(session.load([Path(runner_temp, EXECUTION), Path(home, ".claude/projects")])))
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
-        print(f"::warning::Couldn't read the review's usage: {record['error']}")
+        print(f"::warning::Couldn't read the review's usage: {log_value(record['error'])}")
     try:
         with open(github_step_summary, "a") as f:
             f.write(session.usage_table(record))
@@ -749,23 +774,23 @@ def post_inline(repo, pr, head_sha, review):
             new = json.loads(gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments", "--input", "-",
                                 input=json.dumps(fields)).stdout)
             posted[str(new["id"])] = tag[1] if tag else "P2"
-        except UNREADABLE as e:
-            print(f"::warning::Couldn't post the inline comment on {c['path']}:{c['line']}: {e}")
-            text = body[tag.end() if tag else 0:].strip()
-            review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": text.split("\n")[0],
-                                           "location": f"{c['path']}:{c['line']}",
-                                           "detail": session.shorten(text, 2000)})
+        except UNREADABLE as e:  # the model's path and gh's echo are untrusted
+            where = f"{c['path']}:{c['line']}"
+            print(f"::warning::Couldn't post the inline comment on {log_value(where)}: {log_value(str(e))}")
+            claim, _, detail = body[tag.end() if tag else 0:].strip().partition("\n")
+            review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": claim, "location": where,
+                                           "detail": session.shorten(detail.strip(), 2000)})
     return posted
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4"):
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4"):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
     redacted: model output from untrusted input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
     point here, and loses its marker so a later failure starts a fresh one."""
     try:
-        review = render_summary.over_gpu_cap(json.loads(output), max_gpus)
+        review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
         posted = post_inline(repo, pr, head_sha, review)
         pages = graphql(THREADS, repo, pr)
         review = render_summary.carried(review, *earlier_review(repo, pr))
@@ -773,7 +798,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4
                                      salvaged == "true")
     except Exception as e:
         text = ""
-        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {e}")
+        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")
     text = redact(text)
     if not text.strip():
         print("::warning::The review returned no summary to render.")
@@ -793,7 +818,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4
             gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{cid}", "--input", "-",
                input=json.dumps({"body": body}))
         except RuntimeError as e:
-            print(f"::warning::Couldn't mark comment {cid} resolved: {e}")
+            print(f"::warning::Couldn't mark comment {cid} resolved: {log_value(str(e))}")
 
 
 def hide(out, repo, pr, new_id):
@@ -815,13 +840,13 @@ def hide(out, repo, pr, new_id):
                    "classifier: OUTDATED}) { clientMutationId } }", "-f", f"id={c['id']}")
 
 
-def labels(out, repo, pr, output):
+def labels(out, repo, pr, runner_temp):
     """The PR's type/* labels, from the review's structured output. Model output, so each is checked
     against the fixed list before it reaches the API; type/* labels the review no longer returns are
     removed. Area and size labels come from pr-labels.yml."""
     try:
-        types = json.loads(output).get("types") or []
-    except (ValueError, AttributeError):
+        types = finished_review(runner_temp).get("types") or []
+    except (OSError, ValueError, AttributeError):
         types = []
     wanted = [f"type/{t}" for t in (types if isinstance(types, list) else []) if t in TYPES]
     if not wanted:
