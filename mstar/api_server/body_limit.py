@@ -76,9 +76,6 @@ class BodyLimitMiddleware:
                     declared = int(value)
                 except ValueError:
                     break
-                if declared > limit:
-                    await _reject(send, path, limit)
-                    return
                 break
 
         received = 0
