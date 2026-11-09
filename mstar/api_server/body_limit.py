@@ -93,7 +93,6 @@ class BodyLimitMiddleware:
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > limit:
-                    exceeded = True
                     raise BodyTooLargeError(limit)
             return message
 
