@@ -20,6 +20,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -242,15 +243,19 @@ def comment_on_issue(repo, number, body):
 
 # ---------------------------------------------------------------- preflight job
 
+AUTHOR_NEEDS_WRITE = ("`/review` and `/review nogpu` take a PR author with write access; "
+                      "comment `/review light` instead.")
+
+
 def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label, team_turns="2000",
               self_turns="40"):
     """Whether a comment starts a review, in which mode (`command`, one of the workflow's fixed words)
     and with which turn cap; a request it turns down for a reason the commenter can act on gets a
     one-line reply. Write access is checked against the actor's permission; a contributor may run
-    `/review light` or `/review continue` on their own PR, and only then is `non_write_user` set. A
-    full review runs the PR's code, so it also takes an author with write access (author_association
-    can't tell write from read) and a head repository head_trusted accepts; a PR that can't be read
-    means no."""
+    `/review light` or `/review continue` on their own PR, and only then is `non_write_user` set. A nogpu
+    or full review also takes an author with write access (author_association can't tell write from read);
+    a full one runs the PR's code, so also a head repository head_trusted accepts, and a PR that can't be
+    read means no. A /review continue is held to its mode's rule in restore."""
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the review.")
         out["run"] = "false"
@@ -262,13 +267,17 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
 
     perm = permission(repo, actor)
     if perm in WRITE:
-        if command == "full" and not (permission(repo, author) in WRITE
-                                      and head_trusted(repo, read(api, f"repos/{repo}/pulls/{pr}") or {})):
-            print(f"::notice::{author} or the PR's head repository lacks write access; a full review runs its code.")
+        if command in ("nogpu", "full") and permission(repo, author) not in WRITE:
+            print(f"::notice::{author} lacks write access; this review needs it.")
             out["run"] = "false"
-            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes an author with write access and a "
-                            "head branch on this repository or a fork owned by someone with write access; comment "
-                            "`/review nogpu` for the review without the live test.")
+            reply(repo, pr, AUTHOR_NEEDS_WRITE)
+            return
+        if command == "full" and not head_trusted(repo, read(api, f"repos/{repo}/pulls/{pr}") or {}):
+            print("::notice::The PR's head repository lacks write access; a full review runs its code.")
+            out["run"] = "false"
+            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes a head branch on this repository or "
+                            "a fork owned by someone with write access; comment `/review nogpu` for the review "
+                            "without the live test.")
             return
         out.update(run="true", mode=mode, turns=team_turns)
         return
@@ -319,7 +328,8 @@ def resolve(out, repo, pr, mode, runner_temp, non_write=""):
     out["timeout"] = 25 if non_write else 300
     if mode == "":
         try:
-            restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write)
+            restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write,
+                    (pull.get("user") or {}).get("login", ""))
         except Exception:  # a refusal too, so it can't overwrite the stopped review's comment
             out.update(why="the saved handoff couldn't be read; try `/review continue` again", refused="true")
             raise
@@ -327,13 +337,14 @@ def resolve(out, repo, pr, mode, runner_temp, non_write=""):
         out["mode"] = mode if mode in ("nogpu", "full") else "light"  # sets the prompt's reporting bar
 
 
-def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
+def restore(out, repo, pr, head_sha, runner_temp, non_write="", author=""):
     """/review continue: fetch the handoff a stopped review saved (handoff) into $RUNNER_TEMP/prev, and
     that review's mode. The newest unexpired artifact for this PR wins, and only
     from this workflow on issue_comment, a trigger that runs the base repository's copy of it: a fork's
     own workflow can upload an artifact with any name. Only while the stopped review's "didn't
     complete" comment is still open, since any later run that finishes rewrites it as resolved. The
-    handoff's values are checked before use; a nogpu one needs write access to continue."""
+    handoff's values are checked before use; a nogpu one takes what `/review nogpu` takes: a commenter
+    and an author with write access."""
     name = f"claude-review-handoff-{pr}"
 
     def fail(why):
@@ -383,8 +394,9 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
         fail("a `/review` that stopped can't be continued (its live test never started); comment `/review` again")
     if mode not in ("light", "nogpu"):
         fail("the saved handoff is malformed")
-    if mode == "nogpu" and non_write:
-        fail("continuing a nogpu review takes write access, like `/review nogpu`")
+    if mode == "nogpu" and (non_write or permission(repo, author) not in WRITE):
+        fail("continuing a nogpu review takes write access for the commenter and the PR's author, like "
+             "`/review nogpu`; ask for a new review with `/review light`")
     out.update(dir=str(saved), mode=mode)
 
 
@@ -717,15 +729,45 @@ def earlier_review(repo, pr):
     return state, any(permission(repo, login) in WRITE for login in answering)
 
 
+def post_inline(repo, pr, head_sha, review):
+    """Post the review's inline comments (`inline_comments`, taken out of `review`), anchored to the reviewed commit:
+    model output from untrusted input, so redacted and then made inert, with its fenced code left as written so a
+    suggestion applies cleanly. One call each, a second apart, since one line GitHub refuses fails a whole batched
+    review, and a batch doesn't say which comment got which id. GitHub also decides whether a line is in the diff.
+    One it won't take goes on the review's `outside_diff`, as the summary's own, so no finding is lost. {id: priority
+    tag} of what posted."""
+    posted = {}
+    for i, c in enumerate(review.pop("inline_comments", [])):
+        if i:
+            time.sleep(1)
+        body = render_summary.inert_report(redact(c["body"]))
+        side, tag = c.get("side", "RIGHT"), render_summary.TAG.match(body)
+        fields = {"commit_id": head_sha, "path": c["path"], "line": c["line"], "side": side, "body": body}
+        if c.get("start_line", c["line"]) < c["line"]:
+            fields.update(start_line=c["start_line"], start_side=side)
+        try:
+            new = json.loads(gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments", "--input", "-",
+                                input=json.dumps(fields)).stdout)
+            posted[str(new["id"])] = tag[1] if tag else "P2"
+        except UNREADABLE as e:
+            print(f"::warning::Couldn't post the inline comment on {c['path']}:{c['line']}: {e}")
+            text = body[tag.end() if tag else 0:].strip()
+            review["outside_diff"].append({"priority": tag[1] if tag else "P2", "claim": text.split("\n")[0],
+                                           "location": f"{c['path']}:{c['line']}",
+                                           "detail": session.shorten(text, 2000)})
+    return posted
+
+
 def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4"):
-    """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
-    untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
-    counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
-    doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
+    """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
+    redacted: model output from untrusted input. Read the PR's threads after posting the inline comments, so the
+    status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
+    re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
     point here, and loses its marker so a later failure starts a fresh one."""
-    pages = graphql(THREADS, repo, pr)
     try:
         review = render_summary.over_gpu_cap(json.loads(output), max_gpus)
+        posted = post_inline(repo, pr, head_sha, review)
+        pages = graphql(THREADS, repo, pr)
         review = render_summary.carried(review, *earlier_review(repo, pr))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
@@ -736,9 +778,10 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
-    # What the approval rule reads, with what it carried over and the inline findings as they stand now, for
-    # the rule to check they are still there, unchanged.
-    out["result"] = redact(json.dumps({**review, "inline": render_summary.inline_findings(pages)}))
+    # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
+    # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
+    # they are still there, unchanged.
+    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}}))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")
@@ -795,9 +838,9 @@ def labels(out, repo, pr, output):
 def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
     """A review that stopped before it finished: the handoff a `/review continue` starts from
     ($RUNNER_TEMP/handoff), from the execution file or, after a timeout, the transcript Claude Code writes
-    as it goes, and partial.md, what the "didn't complete" comment shows. A continued run that stops too
-    merges its handoff onto the one it started from (`prev`). Model notes on the PR's own content, so
-    redacted as the summary is; the artifact is public on a public repo."""
+    as it goes. A continued run that stops too merges its handoff onto the one it started from (`prev`).
+    Model notes on the PR's own content, so redacted as the summary is; the artifact is public on a public
+    repo."""
     previous = None
     if prev:
         try:
@@ -818,29 +861,26 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
     saved.mkdir(parents=True, exist_ok=True)
     (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h})))
     (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode)))
-    Path("partial.md").write_text(render_summary.inert(redact(session.partial_md(h))))
     out["dir"] = str(saved)
 
 
 def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_continue="false", refused="false"):
-    """Anything failed: say so on the PR rather than leaving silence, with what the run had so far
-    (partial.md). Repeated failures update one comment, found by its marker, so retries don't stack up
-    comments. A refused /review continue has a marker of its own, so it never writes over a stopped
-    review's comment (its partial results, and that it can still be continued by someone else)."""
+    """Anything failed: say so on the PR rather than leaving silence. Repeated failures update one comment,
+    found by its marker, so retries don't stack up comments. A refused /review continue has a marker of its
+    own, so it never writes over a stopped review's comment (that it can still be continued by someone
+    else). A stopped review posted nothing: its findings are in its notes, and the comment says so."""
     if refused == "true":
         # A /review continue that had nothing usable to continue from; `why` says what to do.
         marker = REFUSED
         text = f"{marker}\n`/review continue` didn't run: {why}. [Log]({run_url}).\n"
     else:
         marker = INCOMPLETE
-        then = ("Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or the "
-                "same `/review` command to start over." if can_continue == "true"
+        then = ("Its findings post only when a review finishes, so they aren't on the PR yet; they are in the notes "
+                "`/review continue` starts from. Comment `/review continue` to carry on in a fresh session (kept for "
+                "7 days), or the same `/review` command to start over." if can_continue == "true"
                 else "Comment the same `/review` command to retry.")
         text = (f"{marker}\nThe automated review didn't complete: {why}{f' ({detail})' if detail else ''}. "
                 f"[Log]({run_url}). {then}\n")
-    partial = Path("partial.md")
-    if partial.is_file() and partial.stat().st_size:
-        text += "\nWhat it had so far:\n\n" + partial.read_text()
     earlier = marked(read(api_list, f"repos/{repo}/issues/{pr}/comments") or [], marker)
     if earlier:
         gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{earlier[-1]}", "--input", "-",
@@ -1185,9 +1225,55 @@ def main(steps):
                     f.write(f"{key}={value}\n")
 
 
+# ---------------------------------------------------------------- merge-queue check
+
+# A merge-queue branch GitHub makes for an entry: gh-readonly-queue/<base>/pr-<number>-<base sha>.
+QUEUE_REF = re.compile(r"(?:refs/heads/)?gh-readonly-queue/.+/pr-(\d+)-[0-9a-f]{40}")
+# The states that change where a reviewer stands. COMMENTED and PENDING don't.
+DECIDING = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def merge_approved(reviews, head, has_write, bots):
+    """(passes, why): whether the PR, at `head`, may merge on its reviews (GitHub's, oldest first): someone stands at
+    APPROVED who is a person with write access, or one of the bot's `bots` logins, on `head`. A person's approval
+    is GitHub's business and doesn't go stale on a push (`main`'s protection as it is). A later CHANGES_REQUESTED or
+    a dismissal takes back that reviewer's approval. A person without write access doesn't count, or their word
+    would rescue a stale bot approval that GitHub's own rule still counts."""
+    standing = {}
+    for r in reviews:
+        if r.get("state") in DECIDING and r.get("user"):
+            standing[r["user"]["login"]] = r
+    approved = {login: r for login, r in standing.items() if r["state"] == "APPROVED"}
+    people = [login for login, r in approved.items() if r["user"].get("type") == "User" and login not in bots]
+    person = next((login for login in people if has_write(login)), None)
+    if person:
+        return True, f"approved by {person}"
+    bot = [r for login, r in approved.items() if login in bots]
+    if any(r.get("commit_id") == head for r in bot):
+        return True, f"the bot approved the PR's head {head[:7]}"
+    return False, (f"the bot's approval is on {bot[-1].get('commit_id', '?')[:7]}, not the PR's head {head[:7]}: "
+                   "a new `/review` or a person's approval is needed" if bot else "no current approval")
+
+
+def approval_current(out, repo, head_ref):
+    """The merge-queue check that a bot approval counts only for the commit it reviewed (review-approval-current.yml).
+    A ref that doesn't parse or any failed read fails it."""
+    m = QUEUE_REF.fullmatch(head_ref)
+    if not m:
+        sys.exit(f"::error::Not a merge-queue branch: {head_ref}")
+    pr = int(m[1])
+    head = api(f"repos/{repo}/pulls/{pr}")["head"]["sha"]
+    passes, why = merge_approved(api_list(f"repos/{repo}/pulls/{pr}/reviews"), head,
+                                 lambda login: permission(repo, login) in WRITE, BOT_USERS)
+    if not passes:
+        sys.exit(f"::error::PR #{pr} has no approval for its current commit: {why}")
+    print(f"::notice::PR #{pr}: {why}.")
+
+
 STEPS = {"preflight": preflight, "react": react, "resolve": resolve, "collect": collect, "salvage": salvage,
          "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
-         "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post}
+         "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post,
+         "approval_current": approval_current}
 
 if __name__ == "__main__":
     main(STEPS)
