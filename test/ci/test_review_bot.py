@@ -472,8 +472,9 @@ class TestCollect(unittest.TestCase):
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
         _, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}":
                                                    compare("ahead", pr_diff("x = 1", "z"))})
-        self.assertIn(" |-    y = 2\nR11 |+    y = 3", files["since.diff"],
-                      "a deleted line's number here is from the last review, and GitHub would refuse or misplace it")
+        self.assertIn(" |-    y = 2\nR11 |+    y = 3", files["since.diff"])
+        self.assertNotIn("L11 |", files["since.diff"],
+                         "a deleted line's number here is from the last review, and GitHub would refuse or misplace it")
 
     def test_with_the_review_app_only_its_login_is_the_bot(self):
         forged = {**summary(LAST), "user": {"login": "github-actions[bot]"}}
@@ -617,7 +618,7 @@ def assistant(*content):
 
 
 class TestHandoff(unittest.TestCase):
-    def handoff(self, messages, previous=None):
+    def handoff(self, messages, previous=None, job_token=""):
         """bot.handoff after a run that left `messages`, continuing a run whose handoff.json is `previous`."""
         with tempfile.TemporaryDirectory() as temp, workspace():
             if messages is not None:
@@ -627,7 +628,8 @@ class TestHandoff(unittest.TestCase):
                 prev = str(Path(temp, "prev"))
                 Path(prev).mkdir()
                 Path(prev, "handoff.json").write_text(previous)
-            out, _ = step(bot.handoff, {}, pr="7", head_sha="abc", mode="light", runner_temp=temp, home=temp, prev=prev)
+            out, _ = step(bot.handoff, {}, pr="7", head_sha="abc", mode="light", runner_temp=temp, home=temp, prev=prev,
+                          job_token=job_token)
             saved = Path(temp, "handoff")
             return (out, json.loads((saved / "handoff.json").read_text()) if saved.exists() else None,
                     (saved / "handoff.md").read_text() if saved.exists() else "")
@@ -635,11 +637,13 @@ class TestHandoff(unittest.TestCase):
     def test_a_handoff_merges_onto_the_one_it_continued_and_keeps_leads_off_the_pr(self):
         earlier = json.dumps({"runs": 1, "comments": [], "reads": ["pr-head/z.py"], "note": "", "recent_text": ""})
         token = "ghp_" + "a" * 36
+        job_token = "ghs1234567890abcdef"  # not shaped like a credential, so only `exact` can catch it
         out, h, md = self.handoff([
-            assistant({"type": "text", "text": f"**Progress:** P1 `b.py:7` unverified {token}"}),
-        ], earlier)
+            assistant({"type": "text", "text": f"**Progress:** P1 `b.py:7` unverified {token} {job_token}"}),
+        ], earlier, job_token)
         self.assertEqual((h["pr"], h["runs"], h["reads"]), ("7", 2, ["pr-head/z.py"]))
-        self.assertIn("**Progress:** P1 `b.py:7` unverified [REDACTED]", md, "a token would reach a public artifact")
+        self.assertIn("**Progress:** P1 `b.py:7` unverified [REDACTED] [REDACTED]", md,
+                      "a token would reach a public artifact")
         self.assertEqual(self.handoff(None, json.dumps({"runs": 1, "comments": [], "reads": [],
                                                         "note": "Progress: a.py done", "recent_text": ""}))[1]["note"],
                          "Progress: a.py done", "a continued run that said nothing would drop the handoff it had")
@@ -742,6 +746,22 @@ class TestAfterTheReview(unittest.TestCase):
                          "a later step couldn't tell an edited finding")
         self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
 
+    def test_an_escaped_character_before_a_token_shape_cant_break_the_post(self):
+        fields = {"outside_diff": [], "since_last": "\x0eyJabcdefghijk.lmnopqrstuv.w \u00eeyJabcdefghijk.lmnopqrstuv.w",
+                  "description_problems": [],
+                  "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
+                  "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}}
+        with workspace():
+            Path(bot.EXECUTION).write_text(json.dumps([{"type": "result", "subtype": "success", "is_error": False,
+                                                        "structured_output": fields}]))
+            out, _ = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", head_sha=HEAD, mode="light", salvaged="false", runner_temp=".")
+        self.assertEqual(out["id"], "99")
+        self.assertEqual(json.loads(out["result"])["risk"]["level"], "low")
+
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
         token = "sk-ant-" + "x" * 30
         review = {"outside_diff": [], "since_last": f"leaked {token}", "description_problems": [],
@@ -822,6 +842,29 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertIn("```suggestion\nuse(@team)\n```", posted[0]["body"], "an applied suggestion would carry "
                       "zero-width spaces")
         self.assertTrue(posted[0]["body"].startswith("**[P1]** "), "the tag the bot counts findings by would be gone")
+
+    def test_the_jobs_token_is_removed_from_all_it_posts_however_spelled(self):
+        token = "ghs1234567890abcdef"  # not shaped like a credential, so only `exact` can catch it
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        posted, summaries = [], []
+        review = {"outside_diff": [{"priority": "P2", "claim": f"c {token}", "location": "b.py:1", "detail": basic}],
+                  "since_last": f"plain {token}, stored {basic}", "description_problems": [],
+                  "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
+                  "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
+                      {"path": "a.py", "line": 3, "body": f"**[P1]** x {basic.rstrip('=')} y"}]}
+        url = "https://github.com/o/r/pull/7#issuecomment-99"
+        with workspace():
+            step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": lambda argv, stdin: posted.append(json.loads(stdin)) or {"id": 1},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": lambda argv, stdin: summaries.append(stdin) or url, "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false",
+                job_token=token)
+        for text in (posted[0]["body"], summaries[0]):
+            self.assertNotIn(token, text, "the token itself would be posted")
+            self.assertNotIn(basic.rstrip("="), text, "the token as actions/checkout stores it would be posted")
+        state = json.dumps(render_summary.saved_state(summaries[0]))
+        self.assertNotIn(token, state, "the summary's hidden state would give the token back")
 
     def test_a_refused_comment_cant_start_a_workflow_command(self):
         review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],

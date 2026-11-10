@@ -207,21 +207,28 @@ def newest(texts, limit):
 
 def diff_paths(diff_text):
     """The files ``pr.diff`` adds or changes, in order (deleted files, ``+++ /dev/null``, have
-    nothing to open)."""
-    lines = diff_text.splitlines()
+    nothing to open). Lines end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on
+    those) could start a line that looks like a header."""
+    lines = diff_text.split("\n")
     paths = []
     for before, line in zip(lines, lines[1:], strict=False):
         if not (before.startswith("--- ") and line.startswith("+++ ")):
             continue
-        path = line[len("+++ "):].rstrip("\t\r")
-        if path.startswith('"'):
-            # Git quotes a path with unusual characters, as a C string of its UTF-8 bytes.
-            if len(path) < 2 or not path.endswith('"'):
-                continue
-            path = C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
-        if path.startswith("b/"):
+        path = unquoted(line[len("+++ "):])
+        if path and path.startswith("b/"):
             paths.append(path[len("b/"):])
     return paths
+
+
+def unquoted(path):
+    """A path as a diff header prints it, trailing tab or CR dropped and unquoted: git quotes a path with unusual
+    characters, as a C string of its UTF-8 bytes. None when the quote doesn't close."""
+    path = path.rstrip("\t\r")
+    if not path.startswith('"'):
+        return path
+    if len(path) < 2 or not path.endswith('"'):
+        return None
+    return C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
 
 
 def numbered(diff_text, left=True):

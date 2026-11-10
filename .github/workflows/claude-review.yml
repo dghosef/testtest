@@ -25,15 +25,18 @@ name: Claude Review
 #   4. The job's token can write only to pull requests, and the review app's
 #      token (below) only to pull requests and issues of this repository, and
 #      in full mode to the media repository's contents
-#      (REVIEW_MEDIA_REPO). The job token has no issues: write (the app token
-#      it mints does, to post and react) and can't read repository variables.
+#      (REVIEW_MEDIA_REPO). The one exception is the approval's own token,
+#      minted for the approve step alone, which has contents write on this
+#      repository (GitHub counts an app's approval only when it can push); that
+#      step runs no model and no PR code. The job token has no issues: write
+#      (the app token it mints does, to post and react) and can't read
+#      repository variables.
 #      The model has no shell and no mutation tools: it returns its inline
 #      findings and the summary as fields, which a workflow step redacts, makes
 #      inert and posts. In light
 #      and nogpu mode the worst case for a prompt injection is a bad
 #      comment. In full mode the live test runs the PR's code with a shell on
-#      the GPU box, as root on a shared Slurm node; see the README's threat
-#      model for what that box can reach.
+#      the GPU box; see the README's threat model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 #   6. Every step that isn't an action runs main's .github/review/bot.py (or,
@@ -43,14 +46,14 @@ name: Claude Review
 #      fixed list), and what it posts goes to gh on stdin.
 #
 # `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
-# here either: it rents GPUs (the team's Slurm nodes, else an open Eras listing),
+# here either: it rents GPUs (an open Eras listing),
 # starts the live-test session on that box (gpu_review_box.sh), waits for it,
 # collects its report and media, posts them, and approves the PR when the rule
 # in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
 # review's notes and the PR's title and description (pr-body.md) as data, and its
-# own Anthropic key (LIVE_TEST_ANTHROPIC_KEY), never a GitHub token or a cloud
-# key; the GPUs go when the box's session ends (Slurm's --time, Eras's Pod
-# deadline), whether or not this job is still running.
+# own Anthropic key (an Eras secret), never a GitHub token or a cloud key; the
+# GPUs go when the box's session ends (or at the Eras Pod's deadline), whether
+# or not this job is still running.
 
 # When it runs, and who can cause it. Only on request; opening or pushing to
 # a PR never starts a review.
@@ -420,6 +423,8 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
+          # What post removes from everything it posts, however it's spelled, whatever the read rules do.
+          JOB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
@@ -457,6 +462,7 @@ jobs:
         id: save
         continue-on-error: true
         env:
+          JOB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.pr.outputs.mode }}
           PREV: ${{ steps.pr.outputs.dir }}
@@ -524,17 +530,11 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables. From secrets: the ssh key every box is reached
-      # with, and REVIEW_SLURM_NODES, each node's host and pinned host key (a step's env: is printed to
-      # the public log before the step runs, so it can't mask a variable in time). The key stays on the
-      # runner: it never reaches the box.
+      # gpu.py's settings, from repository variables, and from a secret the ssh key every box is
+      # reached with. The key stays on the runner: it never reaches the box.
       - name: Configure the GPUs
         env:
           SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
-          SLURM_NODES: ${{ secrets.REVIEW_SLURM_NODES }}
-          SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
-          COMMENTER: ${{ github.triggering_actor }}
-          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
           MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
@@ -575,8 +575,6 @@ jobs:
         id: start
         continue-on-error: true
         env:
-          # The box's own key, never the review's: the box runs PR code with a shell.
-          LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
           GPUS: ${{ steps.cfg.outputs.gpus }}
           HOURS: ${{ steps.cfg.outputs.hours }}
@@ -598,16 +596,14 @@ jobs:
 
       # What the box and the providers wrote, redacted in place before anything reads it, so the
       # comment, the kept report and the artifact all get the redacted copy: bot.py's patterns and
-      # the exact values of the secrets and hosts this job holds.
+      # the exact values of the secrets this job holds.
       - name: Redact the live test's output
         if: always() && steps.cfg.outcome == 'success'
         id: redact
         continue-on-error: true
         env:
-          S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
-          NODES: ${{ secrets.REVIEW_SLURM_NODES }}
         run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this
@@ -643,8 +639,7 @@ jobs:
         run: python3 .github/review/gpu_review.py publish
 
       # Minted here, after the live test, since the app's token lasts an hour:
-      # everything below that posts or approves uses it. Reading REVIEW_APPROVALS
-      # takes the app's token (the job's own can't read variables), right before approving.
+      # everything below that posts uses it.
       - name: Mint the review app's token
         if: always() && vars.REVIEW_APP_CLIENT_ID != ''
         id: app
@@ -656,6 +651,21 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+
+      # The approval's own token, the only one on this repository with contents write: GitHub
+      # counts an app's approval only when the app can push (README, One-time setup). The step
+      # it feeds runs no model and no PR code. Reading REVIEW_APPROVALS takes an app token too
+      # (the job's own can't read variables), right before approving.
+      - name: Mint the approval's token
+        if: always() && vars.REVIEW_APP_CLIENT_ID != '' && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
+        id: approver
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
           permission-actions-variables: read
 
       - name: Decide approval
@@ -663,7 +673,7 @@ jobs:
         id: approve
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.approver.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
           SINCE: ${{ steps.carry.outputs.since }}
         run: python3 .github/review/gpu_review.py approve

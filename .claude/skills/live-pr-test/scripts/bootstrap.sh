@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Prepare a GPU box to live-test one PR: a clone + venv + Rust extension per arm.
 #
-# usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--ref SHA] [--no-main] [--untrusted]
+# usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--ref SHA] [--no-main] [--untrusted] [--no-restore]
 #
 #   --ref SHA pins the PR arm to that commit rather than whatever the PR's head is now.
+#   --no-restore starts from an empty compile directory (a cache refresh keeps only what it builds).
 #
 #   $WORKDIR/pr     PR head (refs/pull/<n>/head), its own venv and mstar_rust build
 #   $WORKDIR/main   the PR's base (origin/main, or --base for a stacked PR), likewise (skipped with --no-main)
@@ -23,7 +24,7 @@
 # Runs on the box, not on your laptop. Idempotent: rerunning updates both arms.
 set -euo pipefail
 
-USAGE="usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--ref SHA] [--no-main] [--untrusted]"
+USAGE="usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--ref SHA] [--no-main] [--untrusted] [--no-restore]"
 # before anything is created or installed: a mistaken run (--help, a typo) changes nothing
 case ${1:-} in
   -h|--help) echo "$USAGE"; exit 0;;
@@ -37,6 +38,7 @@ WITH_MAIN=1
 BASE=main
 REF=
 UNTRUSTED=0
+RESTORE=1
 while [ $# -gt 0 ]; do
   case $1 in
     --workdir) WORKDIR=$2; shift 2;;
@@ -45,6 +47,7 @@ while [ $# -gt 0 ]; do
     --ref) REF=$2; shift 2;;
     --no-main) WITH_MAIN=0; shift;;
     --untrusted) UNTRUSTED=1; shift;;
+    --no-restore) RESTORE=0; shift;;
     -h|--help) echo "$USAGE"; exit 0;;
     *) echo "bootstrap.sh: unknown option $1" >&2; echo "$USAGE" >&2; exit 2;;
   esac
@@ -108,23 +111,12 @@ EOF
 # shellcheck disable=SC1091
 source "$WORKDIR/env.sh"
 mkdir -p "$HF" "$HF_HOME"
-if [ -f "$CACHE_TAR" ]; then
+if [ "$RESTORE" = 1 ] && [ -f "$CACHE_TAR" ]; then
   cp "$CACHE_TAR" "$HOME/compile-cache.tar" && tar -C "$(dirname "$COMPILE")" -xf "$HOME/compile-cache.tar" \
     && echo "compile caches restored from $CACHE_TAR ($(du -sh "$COMPILE" | cut -f1))"
 fi
 
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# torchaudio has no 2.12 release, so a plain resolve pairs torch 2.12 with torchaudio 2.11 and libtorchaudio
-# can't load: `mstar serve` exits on every fresh box. Pin one matching family (run on an H200, 2026-11-08) until
-# torchaudio catches up, then delete this.
-mkdir -p "$WORKDIR"
-cat > "$WORKDIR/constraints.txt" <<'PINS'
-torch==2.11.0
-torchvision==0.26.0
-torchaudio==2.11.0
-torchcodec==0.11.1
-PINS
-export UV_CONSTRAINT=$WORKDIR/constraints.txt
 command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 
 checkout() {  # checkout <dir> <ref> <refspec>
@@ -140,17 +132,7 @@ build_arm() {  # build_arm <dir>
     cd "$dir"
     [ -d .venv ] || uv venv -q --python 3.12 --seed
     source .venv/bin/activate
-    # The pins lose only to an arm that moves torch or torchcodec past them: uv can't resolve that, so the arm
-    # installs as it asks and says so. A PR that merely widens the range still resolves to the pinned family.
-    # Any other failure (a network error, say) stops here, so a transient one can't put the arms on different torches.
-    rc=0
-    out=$(uv pip install -q --torch-backend=auto -e ".[all]" maturin 2>&1) || rc=$?
-    [ -z "$out" ] || printf '%s\n' "$out" >&2
-    if [ "$rc" != 0 ]; then
-      grep -qE 'No solution found|unsatisfiable' <<<"$out" || exit "$rc"
-      echo "bootstrap.sh: $dir doesn't resolve with the pinned torch family ($UV_CONSTRAINT); installing it without the pins, so this arm is not on that family: check that its torch and torchaudio match" >&2
-      env -u UV_CONSTRAINT uv pip install -q --torch-backend=auto -e ".[all]" maturin
-    fi
+    uv pip install -q --torch-backend=auto -e ".[all]" maturin
     maturin develop -q --release -m rust/Cargo.toml
     # mstar-server, for rows served with --rust-frontend
     [ ! -d rust/server ] || (cd rust/server && cargo build --release -q)
@@ -174,6 +156,7 @@ fi
   nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
   echo "cpus: $(nproc)  mem: $(free -g | awk '/Mem:/{print $2}')G"
   "$WORKDIR/pr/.venv/bin/python" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+  [ "$RESTORE" = 0 ] || [ ! -f "$CACHE_TAR.info" ] || echo "compile cache: $(paste -sd' ' "$CACHE_TAR.info")"
   if [ "$WITH_MAIN" = 1 ]; then
     echo "--- dependency diff (base vs pr venv) ---"
     diff <(cd "$WORKDIR/main" && uv pip freeze -q --python .venv/bin/python | grep -v '^-e') \

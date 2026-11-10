@@ -199,15 +199,15 @@ def permission(repo, login):
     return (read(api, f"repos/{repo}/collaborators/{login}/permission") or {}).get("permission", "none")
 
 
-def head_trusted(repo, pull, listed=None):
+def head_trusted(repo, pull):
     """Whether the PR's code is held by someone `repo` trusts: a branch of `repo` itself, or a fork whose owner has
-    write access (or is in `listed`, when given). An author with write access can open a PR from anyone's fork, so
-    the author alone doesn't say. A head repository GitHub no longer shows means no."""
+    write access. An author with write access can open a PR from anyone's fork, so the author alone doesn't say. A
+    head repository GitHub no longer shows means no."""
     head = (pull.get("head") or {}).get("repo") or {}
     owner = (head.get("owner") or {}).get("login")
     if head.get("full_name") == repo:
         return True
-    return bool(owner) and (owner in listed if listed is not None else permission(repo, owner) in WRITE)
+    return bool(owner) and permission(repo, owner) in WRITE
 
 
 def redact(text, exact=()):
@@ -590,6 +590,47 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
         out["rereview"] = "true"
 
 
+def untouched(earlier):
+    """The locations of the earlier review's findings outside the diff (`earlier`, what render_summary.carried
+    carried over) whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
+    (rereview_inputs; not interdiff's dropped part, which holds the old patches as written, unnumbered). With
+    neither (no last-review.json, or a /review continue) every one counts as untouched, since that is unknown. Such a
+    finding has no thread to show its lines changed, so the approval reads a re-review's `fixed` or `moot` on it as
+    `disputed` (gpu_review.for_approval)."""
+    since = next((Path(p) for p in ("since.diff", "interdiff.diff") if Path(p).exists()), None)
+    # As bytes: the diff holds what the commits hold, which needn't be UTF-8, and a CR in a line isn't its end.
+    text = since.read_bytes().decode("utf-8", "replace") if since else ""
+    touched = touched_files(text.partition(DROPPED)[0])
+    return [f["location"] for f in (earlier or {}).get("outside_diff", [])
+            if f["location"].partition(":")[0] not in touched]
+
+
+GIT_HEADER = re.compile(r'diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)')
+
+
+def touched_files(diff_text):
+    """Every file a diff touches, on either side: changed, added, deleted (`+++ /dev/null`), renamed from or to,
+    and binary or mode-only changes, by their `diff --git` line. Unlike session.diff_paths, the files a review
+    can open, a file that is gone counts. Lines end only at \\n, as in session.diff_paths. A binary or mode-only
+    change to a path with a space isn't caught (git doesn't quote spaces in its `diff --git` line, so the line can't
+    be split), which fails closed: its finding reads as untouched."""
+    lines = diff_text.split("\n")
+    paths = set()
+    for before, line in zip([""] + lines, lines, strict=False):
+        sides = ()
+        if before.startswith("--- ") and line.startswith("+++ "):
+            sides = ((before[len("--- "):], "a/"), (line[len("+++ "):], "b/"))
+        elif line.startswith(("rename from ", "rename to ")):
+            sides = ((line.split(" ", 2)[2], ""),)
+        elif m := GIT_HEADER.fullmatch(line):
+            sides = ((m[1], "a/"), (m[2], "b/"))
+        for raw, prefix in sides:
+            path = session.unquoted(raw)
+            if path and path.startswith(prefix):
+                paths.add(path[len(prefix):])
+    return paths
+
+
 def last_live_test(comments):
     """The bot's last live-test comment among `comments` ({"user": login, "body": text}), {"sha", "verdict",
     "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
@@ -754,18 +795,18 @@ def earlier_review(repo, pr):
     return state, any(permission(repo, login) in WRITE for login in answering)
 
 
-def post_inline(repo, pr, head_sha, review):
+def post_inline(repo, pr, head_sha, review, exact=()):
     """Post the review's inline comments (`inline_comments`, taken out of `review`), anchored to the reviewed commit:
-    model output from untrusted input, so redacted and then made inert, with its fenced code left as written so a
-    suggestion applies cleanly. One call each, a second apart, since one line GitHub refuses fails a whole batched
-    review, and a batch doesn't say which comment got which id. GitHub also decides whether a line is in the diff.
-    One it won't take goes on the review's `outside_diff`, as the summary's own, so no finding is lost. {id: priority
-    tag} of what posted."""
+    model output from untrusted input, so redacted (with the `exact` values too) and made inert. A fenced block is
+    left as written, so a suggestion applies cleanly. One call each, a second apart, since one line GitHub refuses
+    fails a whole batched review, and a batch doesn't say which comment got which id. GitHub also decides whether a
+    line is in the diff. One it won't take goes on the review's `outside_diff`, as the summary's own, so no finding
+    is lost. {id: priority tag} of what posted."""
     posted = {}
     for i, c in enumerate(review.pop("inline_comments", [])):
         if i:
             time.sleep(1)
-        body = render_summary.inert_report(redact(c["body"]))
+        body = render_summary.inert_report(redact(c["body"], exact))
         side, tag = c.get("side", "RIGHT"), render_summary.TAG.match(body)
         fields = {"commit_id": head_sha, "path": c["path"], "line": c["line"], "side": side, "body": body}
         if c.get("start_line", c["line"]) < c["line"]:
@@ -783,30 +824,54 @@ def post_inline(repo, pr, head_sha, review):
     return posted
 
 
-def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4"):
+def redact_fields(value, exact=()):
+    """`value`, JSON-shaped, with `redact` run on each string in it. Redacting the JSON's text instead can break
+    it: an escape's last letter can join a token pattern."""
+    if isinstance(value, str):
+        return redact(value, exact)
+    if isinstance(value, list):
+        return [redact_fields(v, exact) for v in value]
+    if isinstance(value, dict):
+        return {redact(str(k), exact): redact_fields(v, exact) for k, v in value.items()}
+    return value
+
+
+def job_token_forms(token):
+    """The job's token as a read of it could carry it: as is, and base64 with no padding, so a copy that drops it is
+    caught too."""
+    return (token, base64.b64encode(token.encode()).decode().rstrip("=")) if token else ()
+
+
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token=""):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
-    redacted: model output from untrusted input. Read the PR's threads after posting the inline comments, so the
+    redacted, and with the job's token removed however it is spelled (`job_token`): model output from untrusted
+    input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
     point here, and loses its marker so a later failure starts a fresh one."""
+    exact = job_token_forms(job_token)
     try:
         review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
-        posted = post_inline(repo, pr, head_sha, review)
+        posted = post_inline(repo, pr, head_sha, review, exact)
         pages = graphql(THREADS, repo, pr)
-        review = render_summary.carried(review, *earlier_review(repo, pr))
+        # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
+        earlier, answered = earlier_review(repo, pr)
+        review = redact_fields(render_summary.carried(review, earlier, answered), exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
         text = ""
         print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")
-    text = redact(text)
+    text = redact(text, exact)
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
     # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
     # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
-    # they are still there, unchanged.
-    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}}))
+    # they are still there, unchanged; and the earlier findings outside the diff whose file nothing since touched.
+    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted},
+              "untouched": untouched(earlier)}
+    out["result"] = json.dumps(redact_fields(result, exact))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")
@@ -860,12 +925,12 @@ def labels(out, repo, pr, runner_temp):
         gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", f"labels[]={label}")
 
 
-def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
+def handoff(out, pr, head_sha, mode, runner_temp, home, prev="", job_token=""):
     """A review that stopped before it finished: the handoff a `/review continue` starts from
     ($RUNNER_TEMP/handoff), from the execution file or, after a timeout, the transcript Claude Code writes
     as it goes. A continued run that stops too merges its handoff onto the one it started from (`prev`).
-    Model notes on the PR's own content, so redacted as the summary is; the artifact is public on a public
-    repo."""
+    Model notes on the PR's own content, so redacted as the summary is, the job's token too; the artifact is public
+    on a public repo."""
     previous = None
     if prev:
         try:
@@ -884,8 +949,10 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
         sys.exit("No Claude Code messages to hand off.")
     saved = Path(runner_temp, "handoff")
     saved.mkdir(parents=True, exist_ok=True)
-    (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h})))
-    (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode)))
+    exact = job_token_forms(job_token)
+    meta = redact_fields({"pr": pr, "head_sha": head_sha, "mode": mode, **h}, exact)
+    (saved / "handoff.json").write_text(json.dumps(meta))
+    (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode), exact))
     out["dir"] = str(saved)
 
 
