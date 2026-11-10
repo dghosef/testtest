@@ -129,7 +129,10 @@ class ProsodyPredictor(nn.Module):
     def durations(self, d: torch.Tensor, lengths: torch.Tensor, speed: torch.Tensor) -> torch.Tensor:
         """Integer frames per phoneme, ``[B, T]``; zero on the padded tail."""
         x = self.lstm(d, lengths)
-        duration = torch.sigmoid(self.duration_proj(x)).sum(dim=-1) / speed[:, None]
+        unscaled_duration = torch.sigmoid(self.duration_proj(x)).sum(dim=-1)
+        # A higher speed means fewer frames per phoneme.
+        duration = unscaled_duration / speed[:, None]
+        # Every real phoneme keeps at least one frame, however fast the speech; the padded tail goes to 0 below.
         pred_dur = torch.round(duration).clamp(min=1).long()
         return pred_dur.masked_fill(~length_mask(lengths, d.shape[1]), 0)
 
