@@ -67,9 +67,10 @@ current_platform = cast(Platform, _CurrentPlatform())
 
 def _built_for() -> Platform:
     """The platform torch was built for. Needs no device call."""
-    if torch.version.hip is not None:
+    hip, cuda = torch.version.hip, torch.version.cuda
+    if hip is not None:
         return RocmPlatform()
-    if torch.version.cuda is not None:
+    if cuda is not None:
         return CudaPlatform()
     if getattr(torch.version, "xpu", None) is not None:
         return XpuPlatform()
