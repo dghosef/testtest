@@ -32,9 +32,14 @@ fi
 ANTHROPIC_API_KEY=$(cat /run/live-pr-key/value)
 export ANTHROPIC_API_KEY
 
+# What finish writes when the session left no result.json: `unavailable`, which says nothing about the PR, until
+# the session starts; then a verdict outside the enum, which the bot reads as no valid verdict (`none`) and counts
+# as a failure: the PR's code may have run, so a session that dies, or stops at its turn cap, doesn't count as
+# nothing.
+VERDICT=unavailable
 finish() {
   trap - EXIT
-  [ -s "$OUT/result.json" ] || printf '{"verdict": "unavailable", "summary": "%s"}\n' "$1" > "$OUT/result.json"
+  [ -s "$OUT/result.json" ] || printf '{"verdict": "%s", "summary": "%s"}\n' "$VERDICT" "$1" > "$OUT/result.json"
   touch "$OUT/done"
   await_collection
   exit 0
@@ -48,8 +53,15 @@ curl -fsSL https://claude.ai/install.sh | bash -s "$(field claude)" > "$OUT/inst
   || finish "couldn't install Claude Code"
 
 cd "$W" || finish "no work directory"
-"$HOME/.local/bin/claude" -p "$(cat "$IN/brief.md")" \
+# The session stops at run.json's end_by, a margin before the box's deadline, so what it wrote (the report it
+# writes as it goes, progress.log) is collected rather than lost with the box; one that ran out of time is partial.
+END_BY=$(field end_by)
+[[ $END_BY =~ ^[0-9]+$ ]] || finish "run.json has no end_by"
+VERDICT=no-result NOW=$(date +%s)
+timeout --kill-after=60 "$(( END_BY > NOW ? END_BY - NOW : 1 ))" "$HOME/.local/bin/claude" -p "$(cat "$IN/brief.md")" \
   --model "$(field model)" --effort high --max-turns "$(field turns)" --output-format json \
   --allowedTools "Bash,Read,Write,Edit,Glob,Grep" --disallowedTools "Skill,WebSearch" \
   > "$OUT/claude.json" 2> "$OUT/claude.err"
-finish "the session ended without a result (exit $?)"
+CODE=$?
+[ "$(date +%s)" -lt "$END_BY" ] || { VERDICT=partial; finish "the session ran out of time"; }
+finish "the session ended without a result (exit $CODE)"
