@@ -23,15 +23,17 @@ STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
 # Every login the bot posts as: the app, and github-actions, the job's own token, when the app has no token to
 # give (bot.post falls back to it, and everything before the app). Enough for something a forged post can only
 # add to, such as an inline finding.
-POSTING_BOTS = ("dghosef-review-test", "github-actions")
+POSTING_BOTS = ("mstar-review", "github-actions")
 # Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
 # workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
-BOTS = ("dghosef-review-test",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
+BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
+# The bot's approval still counts these open when fixed above: a PR must fix its own (gpu_review.fixed_only_above).
+MUST_FIX_HERE = ("P0", "P1")
 # disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
 STILL_OPEN = ("open", "disputed")
 # What takes an earlier finding outside the diff out of the state (`carried`).
@@ -272,7 +274,7 @@ def over_gpu_cap(review, max_gpus):
     return review
 
 
-def carried(review, earlier, answered):
+def carried(review, earlier, answered, pages):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
     outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
@@ -281,10 +283,22 @@ def carried(review, earlier, answered):
     judgement stands; its questions, each until a maintainer's comment has answered it and this review says so
     (`answered_questions`), so one comment can't drop the rest; and what the live test can't exercise
     (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no comment makes
-    the bot's GPUs able to run it. Everything here is carried into the next state too."""
+    the bot's GPUs able to run it. Everything here is carried into the next state too.
+    An earlier finding's priority is the most severe of the bot's record of it (the tag on its thread in `pages`,
+    the earlier state's items at its location) and this review's word on it (its verdict, an item restating it):
+    a re-review can raise a priority, never lower it. An item at a location this review cleared (`fixed`, `moot`)
+    is a new finding, which the earlier one doesn't raise; that verdict keeps the earlier priority."""
     earlier = earlier or {}
     verdicts = {f["ref"]: f for f in review["prior_findings"]}
     locations = {f["location"] for f in review["outside_diff"]}
+    cleared = {ref for ref, f in verdicts.items() if f["status"] in CLEARS}
+    top = {}
+    for ref, p in [*inline_findings(pages).items(), *[(f["location"], f["priority"]) for f in earlier.get(
+            "outside_diff", [])], *[(ref, f["priority"]) for ref, f in verdicts.items()]]:
+        top[ref] = min(top.get(ref, p), p)
+
+    def raised(f, ref):
+        return {**f, "priority": min(f["priority"], top.get(ref, f["priority"]))}
 
     def with_verdict(f):
         verdict = verdicts.get(f["location"])
@@ -294,9 +308,10 @@ def carried(review, earlier, answered):
         fixed_in = verdict["status"] == "fixed_above" and verdict.get("fixed_in")
         return {**kept, "fixed_in": fixed_in} if fixed_in else kept
 
-    review = {**review, "outside_diff": [*review["outside_diff"], *[
-        with_verdict(f) for f in earlier.get("outside_diff", []) if f["location"] not in locations
-        and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
+    review = {**review, "prior_findings": [raised(f, f["ref"]) for f in review["prior_findings"]], "outside_diff": [
+        *[f if f["location"] in cleared else raised(f, f["location"]) for f in review["outside_diff"]],
+        *[raised(with_verdict(f), f["location"]) for f in earlier.get("outside_diff", [])
+          if f["location"] not in locations and f["location"] not in cleared]]}
     if not answered:
         old, new = earlier.get("risk"), review.get("risk")
         if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
@@ -340,8 +355,10 @@ def open_findings(review, pages, stacked):
     later review judged still open. A thread someone resolved stays open: only a later review that judged
     it fixed, fixed above or moot clears it. A bot thread someone edited counts as an open P0, whatever a
     later review judged, since the text the review read isn't the bot's. A finding a PR stacked above fixes
-    isn't open: it lands with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the
-    PR's review threads (GraphQL)."""
+    isn't open: it lands with that PR, when that PR is one of `stacked` (judged). Each finding (a thread, an
+    earlier finding's ref, a place outside the diff) counts once, as the most severe of the open rows that name it
+    (its thread's tag, a verdict on it, the items at that place), with that row's place and text. `pages` are the
+    pages of the PR's review threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
@@ -350,22 +367,24 @@ def open_findings(review, pages, stacked):
     def what(ref, text):
         return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
 
-    found, counted = [], {f["location"] for f in review["outside_diff"]}
+    rows = []  # (the finding it names, where, priority, what)
     for first, priority, text, _ in bot_threads(pages):
         ref = str(first.get("databaseId", ""))
         edited = first.get("lastEditedAt")
         if ref in cleared and not edited:
             continue
         where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
-        found.append((where, "P0", EDITED) if edited
-                     else (where, priority, what(ref, text.strip().split("\n")[0])))
-        counted.add(ref)
-    found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
-              for f in review["outside_diff"] if not f.get("fixed_in")]
-    # Judged still open, with no thread or outside_diff item here to count it by.
-    found += [(f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
-              if f["status"] in STILL_OPEN and f["ref"] not in counted]
-    return found
+        rows.append((ref, where, "P0", EDITED) if edited
+                    else (ref, where, priority, what(ref, text.strip().split("\n")[0])))
+    rows += [(f["location"], f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
+             for f in review["outside_diff"] if not f.get("fixed_in")]
+    rows += [(f["ref"], f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
+             if f["status"] in STILL_OPEN]
+    found = {}  # the most severe row's place, priority and text; on a tie, the first row's
+    for key, where, priority, text in rows:
+        if key not in found or priority < found[key][1]:
+            found[key] = (where, priority, text)
+    return list(found.values())
 
 
 def status(review, pages, head, mode, stacked):
@@ -395,7 +414,9 @@ def prior_above(review):
 
 
 def above(finding):
-    return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it."
+    must = " A P0/P1 has to be fixed in this PR itself, not only above." if finding["priority"] in MUST_FIX_HERE \
+        else ""
+    return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it.{must}"
 
 
 def latent(bug):
@@ -489,7 +510,14 @@ def render(review, pages, head, mode, stacked, salvaged=False):
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
     risk = raw.get("risk")
-    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": raw["outside_diff"],
+    # An earlier finding outside the diff that a re-review cleared though nothing touched its file (`untouched`,
+    # bot.untouched) stays in the state, at its priority, so the next review still has it: the approval doesn't
+    # accept that clear (gpu_review.for_approval).
+    # A new item this run put at that place is another finding (carried), so it doesn't stand in for this one.
+    cleared = {f["ref"]: f["priority"] for f in raw.get("prior_findings", []) if f["status"] in CLEARS}
+    kept = [{**f, "priority": min(f["priority"], cleared[f["location"]])}
+            for f in raw.get("untouched") or () if f["location"] in cleared]
+    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": [*raw["outside_diff"], *kept],
              "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
              "latent": raw.get("latent", []),
              "questions": raw["questions"],

@@ -47,8 +47,23 @@ REFUSED = "<!-- claude-review-continue-refused -->"
 # What Claude Code wrote of the run: the action's execution file, and the session transcripts.
 EXECUTION = "claude-execution-output.json"
 TYPES = render_summary.TYPES
-# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads.
-LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+) -->")
+# The first line of the bot's live-test comment (gpu_review.py), the only line of it the bot reads: the commit,
+# the verdict and the GPU vendors it ran on (a comment from before vendors were written ran on NVIDIA alone).
+LIVE_TEST = re.compile(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+)(?: vendors=([a-z,]+))? -->")
+# Hardware other than NVIDIA's, as a word in a PR can name it (untestable): the backstop for the review's own
+# `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
+# `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
+# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable. The AMD words make a
+# PR's live test run on an AMD box too (vendors_of), and those it covers (gpu_review.covered_by_amd) stop
+# counting once it passed there.
+AMD_MODEL = r"mi\d{3}[ax]?"
+AMD = rf"(?:is)?amd(?!64|ahl)[a-z0-9]*|rocm|hip(?:cc)?|{AMD_MODEL}"  # not Amdahl's law
+UNTESTABLE_HARDWARE = re.compile(rf"(?<![a-z0-9])(?:{AMD}|xpu|gaudi|hpu|(?-i:TPU)|(?<!bare[- _])metal"
+                                 r"|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
+AMD_HARDWARE = re.compile(AMD, re.IGNORECASE)
+# The GPU vendors a live test runs on, in the order their boxes start and their reports show: NVIDIA always, AMD
+# for a PR that names AMD hardware.
+VENDORS = {"nvidia": "NVIDIA", "amd": "AMD"}
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")
 THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -82,8 +97,10 @@ FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s
 # author_association values: the team, and the team plus anyone with a merged PR (see the workflow's header).
 TEAM = ("OWNER", "MEMBER", "COLLABORATOR")
 CONTRIBUTORS = (*TEAM, "CONTRIBUTOR")
-# The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
-# comment), and what the model returns.
+# The improvement run, every other day: the days of evidence it reads (its cadence, so issues don't repeat it: only
+# comments and reviews dated inside it, and the bot's resolved findings on a PR active inside it), how much a reader
+# needs (PRs read, and comments kept per PR; characters of a comment), and what the model returns.
+IMPROVE_DAYS = 2
 IMPROVE_ITEMS = 30
 IMPROVE_TEXT = 800
 IMPROVE_SCHEMA = {
@@ -540,7 +557,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if not prev:
         rereview_inputs(out, repo, pull, head_sha, diff, conversation)
     if mode == "full":
-        since_live_test(repo, head_sha, conversation)
+        since_live_test(repo, pull, head_sha, conversation)
     write_stacked_above(out, repo, pull, head_sha)
     write_open_issues(repo, mode)
     out["lines"] = diff.count("\n")
@@ -591,18 +608,17 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
 
 
 def untouched(earlier):
-    """The locations of the earlier review's findings outside the diff (`earlier`, what render_summary.carried
-    carried over) whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
+    """The earlier review's findings outside the diff (`earlier`, what render_summary.carried carries over)
+    whose file no commit since that review touched, by the files since.diff or interdiff.diff touches
     (rereview_inputs; not interdiff's dropped part, which holds the old patches as written, unnumbered). With
     neither (no last-review.json, or a /review continue) every one counts as untouched, since that is unknown. Such a
     finding has no thread to show its lines changed, so the approval reads a re-review's `fixed` or `moot` on it as
-    `disputed` (gpu_review.for_approval)."""
+    `disputed` (gpu_review.for_approval), and the saved state keeps it (render_summary.render)."""
     since = next((Path(p) for p in ("since.diff", "interdiff.diff") if Path(p).exists()), None)
     # As bytes: the diff holds what the commits hold, which needn't be UTF-8, and a CR in a line isn't its end.
     text = since.read_bytes().decode("utf-8", "replace") if since else ""
     touched = touched_files(text.partition(DROPPED)[0])
-    return [f["location"] for f in (earlier or {}).get("outside_diff", [])
-            if f["location"].partition(":")[0] not in touched]
+    return [f for f in (earlier or {}).get("outside_diff", []) if f["location"].partition(":")[0] not in touched]
 
 
 GIT_HEADER = re.compile(r'diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)')
@@ -633,12 +649,12 @@ def touched_files(diff_text):
 
 def last_live_test(comments):
     """The bot's last live-test comment among `comments` ({"user": login, "body": text}), {"sha", "verdict",
-    "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
+    "vendors", "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
     last = None
     for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
         if m and c["user"] in BOT_USERS:
-            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
+            last = {"sha": m[1], "verdict": m[2], "vendors": (m[3] or "nvidia").split(","), "body": c["body"]}
     return last
 
 
@@ -651,13 +667,50 @@ def passed_on_ancestor(repo, live, head_sha):
     return status in ("ahead", "identical")
 
 
-def since_live_test(repo, head_sha, conversation):
+def changed_files(repo, base, sha):
+    """GitHub's entries for the files changed from `base` (a commit or branch) to SHA, or None when its list is too
+    long to check (300 max)."""
+    files = api(f"repos/{repo}/compare/{base}...{sha}").get("files")
+    return None if files is None or len(files) >= 300 else files
+
+
+def file_names(files):
+    """The names in changed_files' entries, a rename's old name too."""
+    return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
+
+
+def hardware_named(pull, changes):
+    """The words of UNTESTABLE_HARDWARE in the PR's title, file names and changed lines (`changes`, changed_files'
+    entries), lowercased."""
+    text = [pull["title"], *file_names(changes)]
+    for f in changes:
+        text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
+    return sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
+
+
+def vendors_of(words):
+    """The vendors whose GPUs the live test runs on, given the hardware words the PR names (hardware_named)."""
+    return [v for v in VENDORS if v == "nvidia" or any(AMD_HARDWARE.fullmatch(w) for w in words)]
+
+
+def vendors_for(repo, pull, sha):
+    """The vendors whose GPUs the live test of `pull` at `sha` runs on (vendors_of), by the hardware it names
+    against the default branch, as the approval reads it. The live test decides with it (gpu_review.carry), and so
+    does the review's since-live-test diff (since_live_test)."""
+    return vendors_of(hardware_named(pull, changed_files(repo, pull["base"]["repo"]["default_branch"], sha) or []))
+
+
+def since_live_test(repo, pull, head_sha, conversation):
     """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
-    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor), for the
-    review's live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused
-    either) the review judges the whole PR."""
+    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor) on every GPU
+    vendor this PR's live test needs (vendors_for, as the live-test job decides), for the review's
+    live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused either, or the vendors
+    couldn't be read) the review judges the whole PR."""
     live = last_live_test(conversation)
     if not passed_on_ancestor(repo, live, head_sha):
+        return
+    vendors = read(vendors_for, repo, pull, head_sha)
+    if vendors is None or not set(vendors) <= set(live["vendors"]):  # unknown, or a vendor that pass didn't run on
         return
     tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
     try:
@@ -856,7 +909,9 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         pages = graphql(THREADS, repo, pr)
         # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
         earlier, answered = earlier_review(repo, pr)
-        review = redact_fields(render_summary.carried(review, earlier, answered), exact)
+        # And the earlier findings outside the diff whose file nothing since touched, for the approval and the state.
+        review = redact_fields({**render_summary.carried(review, earlier, answered, pages),
+                                "untouched": untouched(earlier)}, exact)
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
@@ -868,9 +923,8 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         sys.exit(1)
     # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
     # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
-    # they are still there, unchanged; and the earlier findings outside the diff whose file nothing since touched.
-    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted},
-              "untouched": untouched(earlier)}
+    # they are still there, unchanged.
+    result = {**review, "inline": {**render_summary.inline_findings(pages), **posted}}
     out["result"] = json.dumps(redact_fields(result, exact))
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
@@ -1175,25 +1229,21 @@ def monitor(out, repo, approvals=""):
     ensure_label(repo, "skip-ai-review")  # after the report: a failed write here must not cost the day's report
 
 
-# ---------------------------------------------------------------- improve (a weekly job)
+# ---------------------------------------------------------------- improve (every other day)
 
 def scrub(text):
-    """Comment or model text for the weekly improvement run: `safe` and clipped, with names and links taken out,
+    """Comment or model text for the improvement run: `safe` and clipped, with names and links taken out,
     which `safe` only makes inert."""
     text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![a-z0-9])www\.[^\s`]+", "[link]",
                   re.sub(r"@[\w-]+", "@someone", str(text or "")))
     return safe(text)[:IMPROVE_TEXT]
 
 
-def monday(now):
-    """The date this week started, which names its issue."""
-    return (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-
-
 def pr_evidence(repo, pr, since):
     """What happened on PR `pr` since `since`, for the improvement run: the findings a later review judged moot,
-    its reviews, inline comments and conversation. Logins become a role.
-    A finding someone resolved stays however old it is: GitHub doesn't say when a thread was resolved."""
+    its reviews, inline comments and conversation. Logins become a role. GitHub doesn't say when a thread was
+    resolved, so a finding of the bot's someone resolved is kept, however old, only when the PR is active since
+    `since`: a review or comment from a person or this bot dated inside the window. A quiet PR gives nothing."""
     author = (api(f"repos/{repo}/pulls/{pr}").get("user") or {}).get("login")
     inline, conversation = discussion(repo, pr)
     reviews = [{"user": (r.get("user") or {}).get("login"), "user_type": (r.get("user") or {}).get("type"),
@@ -1201,13 +1251,20 @@ def pr_evidence(repo, pr, since):
                for r in api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
                if (r.get("user") or {}).get("login") not in BOT_USERS]
 
+    def read(c):  # what a reader sees: not empty, and not another bot's
+        return c.get("body") and not (c.get("user_type") == "Bot" and c["user"] not in POSTING_BOT_USERS)
+
+    # A person's review counts whatever its text (most approvals have none); a comment, when a reader sees it.
+    active = any((c.get("created_at") or "") >= since
+                 for c in [*[r for r in reviews if r["user_type"] != "Bot"], *filter(read, [*inline, *conversation])])
+
     def kept(comments):
         rows = []
         for c in comments:
             mine = c["user"] in POSTING_BOT_USERS
-            if not c.get("body") or (c.get("user_type") == "Bot" and not mine):
+            if not read(c):
                 continue
-            if (c.get("created_at") or "") >= since or (mine and c.get("resolved")):
+            if (c.get("created_at") or "") >= since or (active and mine and c.get("resolved")):
                 rows.append({**{k: c[k] for k in ("id", "path", "line", "in_reply_to_id", "resolved", "outdated",
                                                   "url") if k in c},
                              "role": "bot" if mine else "author" if c["user"] == author else "other",
@@ -1224,9 +1281,10 @@ def pr_evidence(repo, pr, since):
 
 
 def improve_inputs(out, repo, key_set):
-    """The evidence for the weekly improvement run (review-improve.yml), in improve-evidence/: one file per PR
-    with a review summary or a stopped review of the bot's in the last three weeks and anything from the last
-    7 days, and status.json, the status issue's signals. `run` stays false without an API key, or with nothing
+    """The evidence for the improvement run (review-improve.yml), in improve-evidence/: one file per PR with a
+    review summary or a stopped review of the bot's in the last three weeks (where to look: a reply can come long
+    after a review) and anything from the last IMPROVE_DAYS days (the evidence), and status.json, the status
+    issue's signals. `run` stays false without an API key, or with nothing
     to read."""
     out["run"] = "false"
     if key_set != "true":
@@ -1234,7 +1292,7 @@ def improve_inputs(out, repo, key_set):
         return
     now = utcnow()
     stamp = "%Y-%m-%dT%H:%M:%SZ"
-    since = (now - datetime.timedelta(days=7)).strftime(stamp)
+    since = (now - datetime.timedelta(days=IMPROVE_DAYS)).strftime(stamp)
     newest_first = dict.fromkeys(
         int(c["issue_url"].rsplit("/", 1)[1])
         for c in reversed(api_list(f"repos/{repo}/issues/comments"
@@ -1255,7 +1313,7 @@ def improve_inputs(out, repo, key_set):
     if status:
         files["status.json"] = status[-IMPROVE_ITEMS:]
     if not files:
-        print("::notice::The bot did nothing this week; no improvement run.")
+        print(f"::notice::The bot did nothing in the last {IMPROVE_DAYS} days; no improvement run.")
         return
     Path("improve-evidence").mkdir()
     for name, value in files.items():
@@ -1264,16 +1322,16 @@ def improve_inputs(out, repo, key_set):
 
 
 def improve_post(out, repo, output=""):
-    """Open the week's issue from the improvement run's structured output, redacted, on stdin. Evidence links
-    stay inside this repository (no `..`, which would climb out of it) and go through redirect.github.com, which
-    keeps them off the PRs' timelines. An empty list opens nothing; a run that returned no list fails. Never
-    touches code, PRs or the bot."""
+    """Open the run's issue, named by the days its evidence covers, from the improvement run's structured output,
+    redacted, on stdin. Evidence links stay inside this repository (no `..`, which would climb out of it) and go
+    through redirect.github.com, which keeps them off the PRs' timelines. An empty list opens nothing; a run that
+    returned no list fails. Never touches code, PRs or the bot."""
     try:
         items = json.loads(output)["improvements"]
     except (ValueError, KeyError, TypeError):
         sys.exit("The improvement run returned no list, so no issue was opened.")
     if not items:
-        print("::notice::Nothing worth raising this week; no issue opened.")
+        print("::notice::Nothing worth raising this time; no issue opened.")
         return
     link = re.compile(rf"https://github\.com/({re.escape(repo)}/[\w./?=#&%-]+)")
     parts = ["What the review bot could improve about itself, most useful first. It changes nothing on its own."]
@@ -1282,7 +1340,9 @@ def improve_post(out, repo, output=""):
                  if m and ".." not in urllib.parse.unquote(m[1])]
         parts.append("\n".join([f"### {n}. {scrub(item['title'])}", "", f"**Change:** {scrub(item['change'])}", "",
                                 f"**Where:** {scrub(item['where'])}", "", "**Evidence:**", *links]))
-    body = json.dumps({"title": f"Review bot: what to improve, week of {monday(utcnow())}",
+    now = utcnow()
+    days = f"{now - datetime.timedelta(days=IMPROVE_DAYS):%Y-%m-%d} to {now:%Y-%m-%d}"
+    body = json.dumps({"title": f"Review bot: what to improve, {days}",
                        "body": redact("\n\n".join(parts)) + "\n"})
     gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body)
 

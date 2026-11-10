@@ -86,7 +86,8 @@ turn re-reads everything read so far.
   on this one (`gh pr list --base <headRefName>`, recursively) and read their code. A finding that a
   PR above fixes for real is still reported, at its priority, as fixed above (status `fixed_above`
   with `fixed_in` set to that PR): "fixed in #N above; merge #N together with this PR, not this one
-  alone". It doesn't block, since the fix lands with it. For real means the later code meets the
+  alone". It doesn't count as open, since the fix lands with it, except that the bot never approves
+  this PR past a P0 or P1 fixed only above: a PR must fix its own. For real means the later code meets the
   same rule: a design or abstraction-fit finding counts only when the computation now lives where
   the finding asks, and a move, rename or deleted file isn't a fix (#392, above #387, deleted
   `dsa.py` but still planned DSA in `preprocess`). A partial fix is a plain open finding. Before
@@ -214,8 +215,10 @@ Phase B, the comparison with the code, is in the abstraction-fit pass.
 
 Start by reading the change (all modes): the whole diff and the code around it: callers, callees,
 and the counterpart across every boundary the change crosses (Python/Rust, sender/receiver, rank 0/
-rank N, conductor/engine, API server/worker). Check the diff against every `AGENTS.md` invariant
-that applies to the layers it touches. Try to disprove each candidate finding before keeping it.
+rank N, conductor/engine, API server/worker). A change to what an HTTP route accepts or returns
+(`mstar/api_server/`, an `OpenAIAdapter`, an `ADAPTER_REGISTRY` entry) has a counterpart in
+`rust/server/`: one that isn't there, or a new `NOT_PORTED` entry, breaks invariant 15. Check the
+diff against every `AGENTS.md` invariant that applies to the layers it touches. Try to disprove each candidate finding before keeping it.
 
 ### 4.1 Behaviour (all modes)
 
@@ -588,8 +591,8 @@ the last review.
   - `targeted`: only the checks the change reaches;
   - `none`: nothing in the change needs a GPU run to settle it (docs, comments, tests, benchmarks,
     or code no served request runs); never a change to what a model or the server does, however
-    small. On a `none` with no passing live test before it, only docs, tests and benchmarks can be
-    approved. The reason says why in one sentence. A change to tests that skip without CUDA gets at
+    small. The bot never approves a `none`: approval needs a live test that passed on the commit.
+    The reason says why in one sentence. A change to tests that skip without CUDA gets at
     least `targeted`: the live test runs CI's tests on the box's GPUs, and GitHub's CPU job never
     does.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
@@ -601,28 +604,30 @@ the last review.
   (one line): the input your trace found, the config that takes the changed branch. Short strings,
   no commands. Empty when you have none. The live test folds them into its risk map.
 - `untestable`: what in this PR the live test can't exercise, as a short string; empty when there is
-  nothing. It names anything of the kind: hardware the bot's GPUs aren't (AMD, Intel, Apple, TPU, a
-  GPU type no offer provides), more GPUs or nodes than a run gets (`REVIEW_GPU_MAX_GPUS`, a multi-node
+  nothing. It names anything of the kind: hardware the bot's GPUs aren't (Intel, Apple, TPU, a GPU
+  type no offer provides; not AMD, whose code the bot runs on an MI300X box of its own when the
+  diff names AMD hardware), more GPUs or nodes than a run gets (`REVIEW_GPU_MAX_GPUS`, a multi-node
   layout), weights or services it can't get, anything else. When the live test can reach none of the
   change, `run` is `none`, even for a change to what a model does on that hardware; when shared code
   changes too, the live test still runs for what it can reach. It doesn't gate the GPU run. It stops
   the bot's approval: such a PR gets the normal review and checklist, and a person approves it.
 
-The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
-counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
+The live test starts only when the review left no open P0–P2 finding (counted by the review's own
+judgement, as the summary's status line counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
 and asks for `/review` again; an open question and the design risk don't hold it back, though both
 still stop approval.
 
-The bot overrides the review's call in two cases: when the PR's last live test didn't pass on an
+The bot overrides the review's call in three cases: when the PR's last live test didn't pass on an
 ancestor of the head (it failed, was partial or unavailable, or ran on a commit since rebased away),
 the live test runs in full, with both kinds of check, whatever the review asked for, so a failure is
 never hidden behind a narrower run; and so does a re-review's `targeted` when no live test ran
 before it, since no GPU run covered the commits that review built on, and its `none` too unless the
-PR changes only docs, tests and benchmarks. A re-review with `untestable` set is exempt from both:
+PR changes only docs, tests and benchmarks; and so does any call when the last pass didn't run on every GPU
+vendor this run needs (NVIDIA only, on a PR that names AMD hardware). A re-review with `untestable` set
+(beyond what an AMD box covers) is exempt from all three:
 that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
 a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
-run" with your reason. It counts as a pass for approval after a passing live test on an ancestor, or
-when the PR changes only docs, tests and benchmarks.
+run" with your reason, and a person approves.
 
 **GPUs are expensive; use as few as settle the question.** Size the box to the largest config the
 plan needs, not the largest the model supports; prefer the smallest model and layout that reaches

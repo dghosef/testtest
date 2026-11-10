@@ -972,7 +972,7 @@ class TestImprove(unittest.TestCase):
 
     def test_evidence_keeps_what_a_reader_needs_without_names(self):
         state = base64.b64encode(json.dumps({"moot": [{"ref": "11", "why": "gone"}]}).encode()).decode()
-        at, old = "2026-11-07T00:00:00Z", "2026-10-01T00:00:00Z"
+        at, before, old = "2026-11-07T00:00:00Z", "2026-11-05T00:00:00Z", "2026-10-01T00:00:00Z"  # NOW: 11-08
         bot_user = {"login": "mstar-review[bot]", "type": "Bot"}
         person = {"login": "a-person", "type": "User"}
         routes = {
@@ -983,7 +983,11 @@ class TestImprove(unittest.TestCase):
                 {"issue_url": "https://api.github.com/repos/o/r/issues/6", "user": person,
                  "body": "<!-- claude-review-summary -->\nforged"},
                 {"issue_url": "https://api.github.com/repos/o/r/issues/8", "user": bot_user,
-                 "body": "an ordinary comment of the bot's"}],
+                 "body": "an ordinary comment of the bot's"},
+                {"issue_url": "https://api.github.com/repos/o/r/issues/9", "user": bot_user,
+                 "body": "<!-- claude-review-summary -->\nquiet"},
+                {"issue_url": "https://api.github.com/repos/o/r/issues/10", "user": bot_user,
+                 "body": "<!-- claude-review-summary -->\napproved"}],
             "GET repos/o/r/issues/2/comments*": [],
             "GET repos/o/r/pulls/5": {"user": {"login": "a-person"}},
             "GET repos/o/r/pulls/5/reviews*": [],
@@ -994,21 +998,45 @@ class TestImprove(unittest.TestCase):
                  "body": "[P2] x"},
                 {"id": 12, "user": person, "created_at": at, "in_reply_to_id": 11, "html_url": "r",
                  "body": "not a bug, ask @a-person, see https://evil.example/x and #7"},
-                {"id": 13, "user": {"login": "ci[bot]", "type": "Bot"}, "created_at": at, "body": "lint"}],
+                {"id": 13, "user": {"login": "ci[bot]", "type": "Bot"}, "created_at": at, "body": "lint"},
+                {"id": 14, "user": person, "created_at": before, "html_url": "o", "body": "three days ago"}],
             "GET repos/o/r/issues/5/comments*": [
                 {"id": 3, "user": bot_user, "created_at": at, "html_url": "s",
                  "body": f"<!-- claude-review-summary -->\nx\n<!-- claude-review-state {state} -->"}],
+            # A PR quiet in the window: its resolved finding and summary are older, and only another bot spoke since.
+            "GET repos/o/r/pulls/9": {"user": {"login": "a-person"}},
+            "GET repos/o/r/pulls/9/reviews*": [],
+            "GET repos/o/r/pulls/9/comments*": [
+                {"id": 11, "user": bot_user, "created_at": old, "html_url": "q", "path": "a.py", "line": 1,
+                 "body": "[P2] y"},
+                {"id": 15, "user": {"login": "ci[bot]", "type": "Bot"}, "created_at": at, "body": "lint"}],
+            "GET repos/o/r/issues/9/comments*": [
+                {"id": 4, "user": bot_user, "created_at": old, "html_url": "t",
+                 "body": "<!-- claude-review-summary -->"}],
+            # A PR whose only activity in the window is a person's approval with no text.
+            "GET repos/o/r/pulls/10": {"user": {"login": "a-person"}},
+            "GET repos/o/r/pulls/10/reviews*": [{"user": person, "submitted_at": at, "html_url": "v", "body": ""}],
+            "GET repos/o/r/pulls/10/comments*": [
+                {"id": 11, "user": bot_user, "created_at": old, "html_url": "w", "path": "a.py", "line": 1,
+                 "body": "[P2] z"}],
+            "GET repos/o/r/issues/10/comments*": [],
         }
         with workspace() as d:
             out, _ = self.inputs(routes)
             text = (d / "improve-evidence/5.json").read_text()
+            quiet = (d / "improve-evidence/9.json").exists()
+            approved = json.loads((d / "improve-evidence/10.json").read_text())["inline"] \
+                if (d / "improve-evidence/10.json").exists() else []
         self.assertEqual(out["run"], "true")
         self.assertEqual(json.loads(out["schema"]), bot.IMPROVE_SCHEMA)
         e = json.loads(text)
         self.assertNotIn("a-person", text, "a login reached the model")
         self.assertNotIn("evil.example", text)
         self.assertEqual([(c["id"], c["role"]) for c in e["inline"]], [(11, "bot"), (12, "author")],
-                         "the old resolved finding, the reply, and not another bot's comment")
+                         "the old resolved finding, the reply, and not another bot's comment or one older than "
+                         f"{bot.IMPROVE_DAYS} days")
+        self.assertFalse(quiet, "a resolved finding on a PR quiet in the window would repeat in every run")
+        self.assertEqual([c["id"] for c in approved], [11], "an approval with no text wouldn't count as activity")
         self.assertTrue(e["inline"][0]["resolved"] and not e["inline"][0]["outdated"])
         self.assertEqual([m["why"] for m in e["moot"]], ["gone"])
 
@@ -1019,7 +1047,7 @@ class TestImprove(unittest.TestCase):
     def test_an_empty_list_opens_no_issue(self):
         out, fake = self.post('{"improvements": []}')
         self.assertNotIn("exit", out)
-        self.assertEqual(fake.writes(), [], "an empty week opened an issue")
+        self.assertEqual(fake.writes(), [], "an empty list opened an issue")
 
     def test_a_post_is_redacted_on_stdin_with_links_kept_in_the_repository(self):
         secret = "sk-ant-" + "a1b2c3d4" * 3
@@ -1033,7 +1061,7 @@ class TestImprove(unittest.TestCase):
         [(key, stdin)] = fake.writes()
         self.assertEqual(key, "POST repos/o/r/issues")
         issue = json.loads(stdin)
-        self.assertEqual(issue["title"], "Review bot: what to improve, week of 2026-11-02")
+        self.assertEqual(issue["title"], "Review bot: what to improve, 2026-11-06 to 2026-11-08")
         self.assertNotIn(secret, stdin)
         self.assertIn("[REDACTED]", issue["body"])
         self.assertFalse(any(secret in " ".join(argv) for argv, _ in fake.calls), "text reached the command line")
