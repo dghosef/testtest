@@ -117,9 +117,9 @@ def wan_vae_decode_dtype() -> torch.dtype:
     swap), and the live version is read, so an upgrade flips it. On ROCm
     ``cudnn.version()`` is MIOpen's, which this threshold doesn't apply to; bf16
     is the fast one there."""
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() or (torch.backends.cudnn.version() or 0) >= 91500:
         return torch.bfloat16
-    return torch.bfloat16 if (torch.backends.cudnn.version() or 0) >= 91600 else torch.float32
+    return torch.float32
 
 
 def latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
