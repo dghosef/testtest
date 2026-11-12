@@ -230,3 +230,21 @@ def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, ro
     conductor.Conductor._launch_workers(spawner)
     assert seen == ["default"] * 4
     assert len(spawner._worker_processes) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_real_gpu_resolves_to_its_platform():
+    """On a real box, unmocked: a ROCm torch on an AMD GPU is RocmPlatform with a gfx arch and no
+    CUDA capability, and a CUDA torch on an NVIDIA GPU is CudaPlatform with an sm_ arch."""
+    platforms.resolve_platform.cache_clear()
+    try:
+        platform = platforms.resolve_platform()
+        if torch.version.hip is not None:
+            assert isinstance(platform, RocmPlatform)
+            assert platform.arch().startswith("gfx")
+            assert platform.cuda_capability() is None
+        else:
+            assert isinstance(platform, CudaPlatform)
+            assert platform.arch() == "sm_%d%d" % torch.cuda.get_device_capability()
+    finally:
+        platforms.resolve_platform.cache_clear()
