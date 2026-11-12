@@ -6,6 +6,7 @@ import math
 import os
 import threading
 import time
+from collections.abc import Iterable
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -62,6 +63,7 @@ from mstar.engine.resources.step import (
     PerReqSetting,
     lean_subsets,
 )
+from mstar.engine.state.adapters import node_handles
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -83,7 +85,7 @@ from mstar.model.submodule_base import (
     StopPolicy,
     engine_step,
 )
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import keep_split_scans_in_their_workspace, with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
@@ -197,6 +199,24 @@ class _MeasuredRow(NamedTuple):
     custom_pos_ids: None = None
 
 
+class SlotRotation:
+    """Which double-buffer slot the next step takes. Leased from the plan thread
+    and the GPU thread both, hence the lock."""
+
+    __slots__ = ("next_slot", "num_slots", "_lock")
+
+    def __init__(self) -> None:
+        self.next_slot = 0
+        self.num_slots = 1
+        self._lock = threading.Lock()
+
+    def lease(self) -> int:
+        with self._lock:
+            slot = self.next_slot
+            self.next_slot = (self.next_slot + 1) % self.num_slots
+            return slot
+
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -221,14 +241,10 @@ class SubmoduleManagement:
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
-    # on a slot. Leased from the plan thread and the GPU thread both, hence the
-    # lock.
-    _next_slot: int = field(init=False, default=0)
-    _num_slots: int = field(init=False, default=1)
+    # on a slot. Nodes that share a resource share this too (see
+    # `share_slot_rotations`), for the same reason.
+    _slots: SlotRotation = field(init=False, repr=False)
     _forced_double_buffer: bool = field(init=False, default=False)
-    _slot_lock: threading.Lock = field(
-        init=False, default_factory=threading.Lock, repr=False
-    )
 
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
@@ -245,6 +261,7 @@ class SubmoduleManagement:
 
     def __post_init__(self):
         self.lean_keys = tuple(key for key, res in self.resources.items() if res.lean_capture)
+        self._slots = SlotRotation()
         # Two hazards want a second slot, both of them the host running ahead of
         # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
         # reading, and ``force_double_buffer`` is the same for a resource
@@ -262,10 +279,9 @@ class SubmoduleManagement:
             and any(res.supports_preplan for res in self.resources.values())
         )
         if not double_buffered:
-            self._num_slots = 1
             return
-        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
-        if self._num_slots < 2:
+        self._slots.num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
+        if self._slots.num_slots < 2:
             # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
             # but neither hazard has a single-buffered form: one slot puts the
             # next step's staging on top of a DMA that may not have retired.
@@ -273,13 +289,13 @@ class SubmoduleManagement:
             # MSTAR_PRE_PLAN_SPEC=0) to drop to a single slot.
             logger.warning(
                 "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
-                "double-buffering; using 2 slots.", self._num_slots,
+                "double-buffering; using 2 slots.", self._slots.num_slots,
             )
-            self._num_slots = 2
+            self._slots.num_slots = 2
 
     @property
     def num_slots(self) -> int:
-        return self._num_slots
+        return self._slots.num_slots
 
     @property
     def needs_slot_fence(self) -> bool:
@@ -292,13 +308,10 @@ class SubmoduleManagement:
         """The slot the next lease hands out. Read unlocked: an int read is
         atomic under the GIL, and the only other leaser is the plan thread,
         which is gated on the previous batch's ``commit_done``."""
-        return self._next_slot
+        return self._slots.next_slot
 
     def lease_slot(self) -> int:
-        with self._slot_lock:
-            slot = self._next_slot
-            self._next_slot = (self._next_slot + 1) % self._num_slots
-            return slot
+        return self._slots.lease()
 
     def lean_of(self, rids) -> frozenset[str]:
         """The keys of the node's resources that every one of ``rids`` lets run lean
@@ -327,6 +340,32 @@ class SubmoduleManagement:
         so a lease-time write would race the replay reading ``_current_slot``."""
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
+
+
+def share_slot_rotations(submodules: Iterable[SubmoduleManagement]) -> None:
+    """Give nodes that share a resource one slot rotation.
+
+    Resources key buffers by slot (`KVManager._static_plan_state`, FlashInfer's
+    workspaces), and pre-plan writes the next step's slot while the current
+    step's graph reads its own. Two nodes rotating apart can land on one slot,
+    and the pre-plan then overwrites what the running graph is reading.
+    """
+    nodes = list(submodules)
+    by_resource: dict[int, SlotRotation] = {}
+    for mgmt in nodes:
+        for resource in mgmt.resources.values():
+            kept = by_resource.setdefault(id(resource), mgmt._slots)
+            if kept is mgmt._slots:
+                continue
+            kept.num_slots = max(kept.num_slots, mgmt._slots.num_slots)
+            merged = mgmt._slots
+            for node in nodes:
+                if node._slots is merged:
+                    node._slots = kept
+            for key, rotation in by_resource.items():
+                if rotation is merged:
+                    by_resource[key] = kept
+
 
 @dataclass
 class ForwardPassInfoWrapper:
@@ -626,6 +665,8 @@ class Engine:
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
+        # before the first forward, which is when every engine- and model-owned torch.compile compiles and tunes
+        keep_split_scans_in_their_workspace()
         self._device = None
         self._device_capability = device_capability
         # nodes whose steps run beside the worker's chain (``EngineManager.build``)
@@ -787,11 +828,15 @@ class Engine:
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
+            handles = node_handles(model, node_name, resources) if model is not None else {}
+            if handles:
+                submodule.bind_node_state(handles)
             loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
             if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
+        share_slot_rotations(self._submodules.values())
         if model is not None:
             self._check_rebuild_policies(model)
 
@@ -1030,7 +1075,8 @@ class Engine:
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
-                    if pw_runner.any_graphs:
+                    # an eager-fallback region serves calls without graphs, so it is kept
+                    if pw_runner.any_graphs or pw_runner.eager_fallback:
                         captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
         if plan is not None:
@@ -1215,6 +1261,7 @@ class Engine:
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
                 segment_keys=getattr(submodule_mgmt.submodule, "segment_keys", ()),
+                state_handles=getattr(submodule_mgmt.submodule, "state_handles", {}),
             )
             runners[label] = runner
         return runners
@@ -1464,14 +1511,15 @@ class Engine:
             for rid in rids:
                 steps.pop(rid, None)
 
-    def inline_client_signals(
+    def inline_signals(
         self, node_name: str, graph_walk: str,
     ) -> dict[str, str]:
-        """The node's client signals that can ride inline this walk."""
+        """The node's signals that can ride inline this walk
+        (``NodeSubmodule.inline_signals``)."""
         mgmt = self._submodules.get(node_name)
         if mgmt is None:
             return {}
-        return mgmt.submodule.inline_client_signals(graph_walk)
+        return mgmt.submodule.inline_signals(graph_walk)
 
     def _prepare_chunk(
         self, batch: ExecutingBatch, rid: int, walk: str, chunk: ChunkRange,
@@ -2185,9 +2233,6 @@ class Engine:
         ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
         """
         nvtx = self._enable_nvtx
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        submodule = submodule_mgmt.submodule
-        rids = list(ctx.padded_request_ids)
 
         if step is not None:
             if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
@@ -2229,6 +2274,35 @@ class Engine:
                 )
                 if nvtx:
                     range_pop()
+
+        try:
+            if step is not None:
+                step.begin_calls()
+            return self._forward_and_commit(
+                batch, submodule_mgmt, request_ids, inputs, req_info, ctx, lease, running_batched, step, set_launch,
+            )
+        finally:
+            if step is not None:
+                step.end_calls()
+
+    def _forward_and_commit(
+        self,
+        batch: ExecutingBatch,
+        submodule_mgmt: SubmoduleManagement,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        req_info: Mapping[str, CurrentForwardPassInfo],
+        ctx: StepContext,
+        lease: SlotLease | None,
+        running_batched: bool,
+        step: SubmoduleStep | None,
+        set_launch: bool,
+    ) -> tuple[dict | None, SubmoduleStep | None]:
+        """preprocess → forward → commit, with the step's handles open."""
+        nvtx = self._enable_nvtx
+        cg_runner = submodule_mgmt.accelerator_graph_runner
+        submodule = submodule_mgmt.submodule
+        rids = list(ctx.padded_request_ids)
 
         laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
@@ -2283,6 +2357,7 @@ class Engine:
                 range_pop()
 
         if step is not None:
+            step.check_calls()
             if nvtx:
                 range_push("engine.commit")
             t0 = phase_start()

@@ -2,6 +2,7 @@
 
 import contextlib
 import functools
+import gzip
 import io
 import json
 import os
@@ -225,6 +226,10 @@ class TestCarry(unittest.TestCase):
         rocm = ("mstar/ops/rocm_attention.py",)
         self.carry(False, "full", ["correctness"], [], "", files=rocm)
         self.assertEqual(self.vendors, "nvidia,amd", "an AMD change could only ever be approved by a person")
+        self.assertEqual(bot.vendors_of(["mi300a", "mi210"]), ["nvidia"], "a box no pass there can clear")
+        self.assertEqual(bot.vendors_of(["mi300a", "mi300x"]), ["nvidia", "amd"])
+        rented, supported = bot.AMD_RENTED, gpu_review.gpu_py.SUPPORTED["amd"]
+        self.assertEqual((rented.pattern, rented.flags), (supported.pattern, supported.flags), "bot.py's copy drifted")
         for untestable, outputs in (("AMD MI300X kernels", full("targeted", "failed")),
                                     ("AMD kernels; the Intel XPU path", {"run": "targeted", "checks": "correctness"})):
             with self.subTest(untestable):
@@ -435,6 +440,12 @@ class TestStart(unittest.TestCase):
         user_data = gpu_review.gpu_py.cloud_config(str(gpu_review.BOX), amd, None)
         self.assertLessEqual(len(user_data.encode()), gpu_review.gpu_py.USER_DATA_MAX,
                              "DigitalOcean would refuse every AMD box of a PR with a long description")
+        sizes = []  # the key's stand-in must compress like a real key, or the cut lands within ~150 bytes too late
+        real = gpu_review.gpu_py.cloud_config
+        with unittest.mock.patch.object(gpu_review.gpu_py, "cloud_config",
+                                        lambda run, files, secret: sizes.append(secret) or real(run, files, secret)):
+            gpu_review.fit_user_data(out, out / "amd", 100)
+        self.assertGreater(len(gzip.compress(sizes[0].encode())), 100, "a repeated letter would size the key at ~20")
 
     def test_no_box_starts_unless_every_vendors_box_can(self):
         mi300x = {"id": "digitalocean:gpu-mi300x1-192gb", "provider": "digitalocean", "gpu": "AMD MI300X",
@@ -545,6 +556,13 @@ class TestComment(unittest.TestCase):
                 (results / "result.json").write_text(text)
                 gpu_review.redact({}, temp)
                 self.assertEqual(json.loads((results / "result.json").read_text()).get("verdict"), verdict)
+        with tempfile.TemporaryDirectory() as temp:  # stopped at END_BY: the artifact says what the comment does
+            results = Path(temp, "lt/nvidia/results")
+            results.mkdir(parents=True)
+            (results / "timed_out").touch()
+            (results / "result.json").write_text('{"verdict": "pass", "summary": "ok"}')
+            gpu_review.redact({}, temp)
+            self.assertEqual(json.loads((results / "result.json").read_text())["verdict"], "partial")
 
     def test_a_box_with_no_verdict_keeps_the_redacted_tail_of_its_sessions_stderr(self):
         for verdict, kept, err in (("unavailable", True, "x" * 9000 + "\n"), ("pass", False, ""),
@@ -777,6 +795,18 @@ class TestComment(unittest.TestCase):
         self.assertIn("on NVIDIA: pass.** ok\n\nnvidia report ![a](https://o.io/m/nvidia/media/a.png)", text)
         self.assertIn("on AMD: pass.** ok\n\namd report ![a](https://o.io/m/amd/media/a.png)", text,
                       "one box's media would overwrite the other's, or link to it")
+        out = Path(tempfile.mkdtemp())  # a session stopped at END_BY: the box script leaves `timed_out`
+        (out / "nvidia/results").mkdir(parents=True)
+        (out / "nvidia/results/timed_out").touch()
+        for written, expected in (("pass", "partial"), ("fail", "fail")):
+            (out / "nvidia/results/result.json").write_text(json.dumps({"verdict": written, "summary": "ok"}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gpu_review.render_comment("0123456789", out, ["nvidia"]), expected,
+                                 "a session that ran out of time would keep a `pass`, or lose a `fail`")
+        (out / "nvidia/results/result.json").write_text('{"verdict": "pass", "summary": "ok"}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            gpu_review.render_comment("0123456789", out, ["nvidia"])
+        self.assertIn("ok The session ran out of time after writing pass.", (out / "comment.md").read_text())
         for amd, unavailable, expected in (('{"verdict": "fail"}', None, "fail"), (None, None, "none"),
                                            (None, "No AMD GPUs @team", "unavailable")):
             with self.subTest(expected):
